@@ -62,6 +62,7 @@ function settingsScopeFixture(
 ): {
   scope: SettingsScope<OpenAICodexSettingsConfig>
   set: ReturnType<typeof vi.fn>
+  mutate: ReturnType<typeof vi.fn>
 } {
   let snapshot: SettingsScopeSnapshot<OpenAICodexSettingsConfig> = {
     status: 'ready',
@@ -84,8 +85,19 @@ function settingsScopeFixture(
     }
     for (const listener of listeners) listener()
   })
+  const mutate = vi.fn<SettingsScope<OpenAICodexSettingsConfig>['mutate']>(async (ops, revision) => {
+    if (revision !== snapshot.revision) throw new Error('stale revision')
+    const next = { ...snapshot.value! }
+    for (const op of ops) {
+      if (op.path.length !== 1) throw new Error('fixture requires top-level fields')
+      Object.assign(next, { [op.path[0]!]: op.op === 'set' ? op.value : undefined })
+    }
+    snapshot = { ...snapshot, value: next, revision: (snapshot.revision ?? 0) + 1 }
+    for (const listener of listeners) listener()
+  })
   return {
     set,
+    mutate,
     scope: {
       getSnapshot: () => snapshot,
       subscribe(listener) {
@@ -93,7 +105,7 @@ function settingsScopeFixture(
         return () => { listeners.delete(listener) }
       },
       set,
-      mutate: vi.fn(async () => { throw new Error('This fixture supports single-field settings writes only.') }),
+      mutate,
       unset: vi.fn(async () => undefined),
     },
   }
@@ -335,11 +347,73 @@ describe('OpenAI Codex Plugin configuration card', () => {
     expect((screen.getByRole('button', { name: en.signOutAll }) as HTMLButtonElement).disabled).toBe(false)
   })
 
+  it('preserves another editor\'s untouched fields when saving a draft', async () => {
+    const { scope } = settingsScopeFixture()
+    vi.stubGlobal('fetch', vi.fn(async () => json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
+    render(<OpenAICodexConfiguration scope={scope} t={t} activeModule="capabilities" />)
+    const image = await screen.findByRole('checkbox', { name: /Enable GPT Image generation/u })
+    fireEvent.click(image)
+    await act(async () => { await scope.set('searchModel', 'remote-model') })
+    fireEvent.click(screen.getByRole('button', { name: en.save }))
+    await screen.findByText(en.settingsSaved)
+    expect(scope.getSnapshot().value).toMatchObject({ searchModel: 'remote-model', enableImageGeneration: true })
+  })
+
+  it('publishes all edited fields in one revision and one notification', async () => {
+    const { scope, mutate, set } = settingsScopeFixture()
+    const observed: unknown[] = []
+    scope.subscribe(() => { observed.push(scope.getSnapshot().value) })
+    vi.stubGlobal('fetch', vi.fn(async () => json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
+    render(<OpenAICodexConfiguration scope={scope} t={t} activeModule="capabilities" />)
+    fireEvent.click(await screen.findByRole('checkbox', { name: /Enable GPT Image generation/u }))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Enable Codex search provider/u }))
+    fireEvent.click(screen.getByRole('button', { name: en.save }))
+    await screen.findByText(en.settingsSaved)
+    expect(set).not.toHaveBeenCalled()
+    expect(mutate).toHaveBeenCalledTimes(1)
+    expect(mutate).toHaveBeenCalledWith([
+      { op: 'set', path: ['enableImageGeneration'], value: true },
+      { op: 'set', path: ['enableSearch'], value: true },
+    ], 0)
+    expect(observed).toHaveLength(1)
+    expect(observed[0]).toMatchObject({ enableSearch: true, enableImageGeneration: true })
+  })
+
+  it('retains the draft without writing when another editor changes the same field', async () => {
+    const { scope, mutate } = settingsScopeFixture(true, { ...DEFAULT_OPENAI_CODEX_SETTINGS, enableSearch: true })
+    vi.stubGlobal('fetch', vi.fn(async () => json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
+    render(<OpenAICodexConfiguration scope={scope} t={t} activeModule="capabilities" />)
+    const model = await screen.findByRole<HTMLInputElement>('textbox', { name: en.searchModel })
+    fireEvent.change(model, { target: { value: 'local-model' } })
+    await act(async () => { await scope.set('searchModel', 'remote-model') })
+    fireEvent.click(screen.getByRole('button', { name: en.save }))
+    await screen.findByText(en.settingsSaveFailed)
+    expect(mutate).not.toHaveBeenCalled()
+    expect(scope.getSnapshot().value?.searchModel).toBe('remote-model')
+    expect(model.value).toBe('local-model')
+  })
+
+  it('rejects an intervening revision without partially saving the draft', async () => {
+    const { scope, mutate } = settingsScopeFixture()
+    const commit = vi.mocked(scope.mutate).getMockImplementation()!
+    mutate.mockImplementationOnce(async (ops, revision) => {
+      await scope.set('searchModel', 'remote-model')
+      await commit(ops, revision)
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
+    render(<OpenAICodexConfiguration scope={scope} t={t} activeModule="capabilities" />)
+    fireEvent.click(await screen.findByRole('checkbox', { name: /Enable GPT Image generation/u }))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Enable Codex search provider/u }))
+    fireEvent.click(screen.getByRole('button', { name: en.save }))
+    await screen.findByText(en.settingsSaveFailed)
+    expect(scope.getSnapshot().value).toMatchObject({ searchModel: 'remote-model', enableImageGeneration: false, enableSearch: false })
+  })
+
   it('stages, discards, and saves optional capability settings in the same card', async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request): Promise<Response> => requestPath(input) === OPENAI_CODEX_MODEL_CATALOG_PATH
       ? json(modelCatalogFixture([{ id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' }, { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))
       : json({ status: 'signed-out' }))
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     vi.stubGlobal('fetch', fetchMock)
 
     render(<OpenAICodexSettings t={t} configScope={scope} embedded />)
@@ -393,13 +467,13 @@ describe('OpenAI Codex Plugin configuration card', () => {
     fireEvent.click(save)
 
     expect(await screen.findByText(en.settingsSaved)).toBeTruthy()
-    expect(set).toHaveBeenCalledWith('enableSearch', true)
-    expect(set).toHaveBeenCalledWith('searchModel', 'gpt-search-custom')
-    expect(set).toHaveBeenCalledWith('searchMode', 'live')
-    expect(set).toHaveBeenCalledWith('searchMaxOutputTokens', 2048)
-    expect(set).toHaveBeenCalledWith('enableImageGeneration', true)
-    expect(set).toHaveBeenCalledWith('autoReviewDisclosureAcknowledged', true)
-    expect(set).toHaveBeenCalledWith('enableAutoReview', true)
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableSearch'], value: true }]), expect.any(Number))
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['searchModel'], value: 'gpt-search-custom' }]), expect.any(Number))
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['searchMode'], value: 'live' }]), expect.any(Number))
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['searchMaxOutputTokens'], value: 2048 }]), expect.any(Number))
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableImageGeneration'], value: true }]), expect.any(Number))
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['autoReviewDisclosureAcknowledged'], value: true }]), expect.any(Number))
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableAutoReview'], value: true }]), expect.any(Number))
     fireEvent.click(enableAutoReview)
     fireEvent.click(save)
     expect(await screen.findByText(en.settingsSaved)).toBeTruthy()
@@ -417,7 +491,7 @@ describe('OpenAI Codex Plugin configuration card', () => {
     const fetchMock = vi.fn(async (input: string | URL | Request): Promise<Response> => requestPath(input) === OPENAI_CODEX_MODEL_CATALOG_PATH
       ? json(modelCatalogFixture(availableModels))
       : json({ status: 'signed-out' }))
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     vi.stubGlobal('fetch', fetchMock)
 
     render(<OpenAICodexSettings t={t} configScope={scope} embedded />)
@@ -435,7 +509,7 @@ describe('OpenAI Codex Plugin configuration card', () => {
     fireEvent.click(screen.getByRole('button', { name: en.save }))
 
     expect(await screen.findByText(en.settingsSaved)).toBeTruthy()
-    expect(set).toHaveBeenCalledWith('models', ['gpt-5.6-luna', 'gpt-5.6-terra'])
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['models'], value: ['gpt-5.6-luna', 'gpt-5.6-terra'] }]), expect.any(Number))
     expect(fetchMock.mock.calls.some(([input]) => requestPath(input) === OPENAI_CODEX_MODEL_CATALOG_PATH)).toBe(true)
   })
 
@@ -452,7 +526,7 @@ describe('OpenAI Codex Plugin configuration card', () => {
         results: [{ proxyUrl: candidate, reachable: true, classification: 'reachable', status: 401 }],
       })
     })
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     vi.stubGlobal('fetch', fetchMock)
 
     render(<OpenAICodexSettings t={t} configScope={scope} embedded />)
@@ -464,17 +538,17 @@ describe('OpenAI Codex Plugin configuration card', () => {
     expect(screen.getByText(en.pendingProxy.replace('{proxyUrl}', candidate))).toBeTruthy()
     expect(screen.getAllByText(en.selectedProxy).length).toBeGreaterThan(0)
     expect(within(screen.getByRole('group', { name: en.currentConnection })).getByText(en.directConnection)).toBeTruthy()
-    expect(set).not.toHaveBeenCalledWith('enableProxy', true)
+    expect(mutate).not.toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableProxy'], value: true }]), expect.any(Number))
 
     fireEvent.click(screen.getByRole('button', { name: en.save }))
     expect(await screen.findByText(en.settingsSaved)).toBeTruthy()
-    expect(set).toHaveBeenCalledWith('proxyUrl', candidate)
-    expect(set).toHaveBeenCalledWith('enableProxy', true)
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['proxyUrl'], value: candidate }]), expect.any(Number))
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableProxy'], value: true }]), expect.any(Number))
     expect(fetchMock.mock.calls.some(([input]) => requestPath(input) === OPENAI_CODEX_PROXY_TEST_PATH)).toBe(false)
 
     fireEvent.click(screen.getByRole('button', { name: en.disableProxy }))
     fireEvent.click(screen.getByRole('button', { name: en.save }))
-    await waitFor(() => { expect(set).toHaveBeenCalledWith('enableProxy', false) })
+    await waitFor(() => { expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableProxy'], value: false }]), expect.any(Number)) })
   })
 
   it('activates only the exact manual proxy draft that passed its latest test', async () => {
@@ -494,7 +568,7 @@ describe('OpenAI Codex Plugin configuration card', () => {
       tested.push(proxyUrl)
       return json({ proxyUrl, reachable: true, classification: 'reachable', status: 401 })
     })
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     vi.stubGlobal('fetch', fetchMock)
 
     render(<OpenAICodexSettings t={t} configScope={scope} embedded />)
@@ -519,11 +593,11 @@ describe('OpenAI Codex Plugin configuration card', () => {
     expect(screen.getByText(en.pendingProxy.replace('{proxyUrl}', second))).toBeTruthy()
     expect(screen.getByText(en.selectedProxy)).toBeTruthy()
     expect(within(screen.getByRole('group', { name: en.currentConnection })).getByText(en.directConnection)).toBeTruthy()
-    expect(set).not.toHaveBeenCalledWith('enableProxy', true)
+    expect(mutate).not.toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableProxy'], value: true }]), expect.any(Number))
     fireEvent.click(screen.getByRole('button', { name: en.save }))
     expect(await screen.findByText(en.settingsSaved)).toBeTruthy()
-    expect(set).toHaveBeenCalledWith('proxyUrl', second)
-    expect(set).toHaveBeenCalledWith('enableProxy', true)
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['proxyUrl'], value: second }]), expect.any(Number))
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableProxy'], value: true }]), expect.any(Number))
     expect(tested).toEqual([first, second])
   })
 
@@ -541,7 +615,7 @@ describe('OpenAI Codex Plugin configuration card', () => {
       const proxyUrl = requestUrl.searchParams.get('proxyUrl') ?? ''
       return json({ proxyUrl, reachable: true, classification: 'reachable', status: 401 })
     })
-    const { scope, set } = settingsScopeFixture(true, {
+    const { scope, mutate } = settingsScopeFixture(true, {
       ...DEFAULT_OPENAI_CODEX_SETTINGS,
       enableProxy: true,
       proxyUrl: first,
@@ -566,8 +640,8 @@ describe('OpenAI Codex Plugin configuration card', () => {
     fireEvent.click(save)
 
     expect(await screen.findByText(en.settingsSaved)).toBeTruthy()
-    expect(set).toHaveBeenCalledWith('proxyUrl', second)
-    expect(set).not.toHaveBeenCalledWith('enableProxy', false)
+    expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['proxyUrl'], value: second }]), expect.any(Number))
+    expect(mutate).not.toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableProxy'], value: false }]), expect.any(Number))
     expect(scope.getSnapshot().value?.enableProxy).toBe(true)
   })
 
@@ -604,12 +678,12 @@ describe('OpenAI Codex Plugin configuration card', () => {
 
   it('keeps the pending proxy change available when the Host save fails', async () => {
     const current = 'http://127.0.0.1:8110'
-    const { scope, set } = settingsScopeFixture(true, {
+    const { scope, mutate } = settingsScopeFixture(true, {
       ...DEFAULT_OPENAI_CODEX_SETTINGS,
       enableProxy: true,
       proxyUrl: current,
     })
-    set.mockRejectedValueOnce(new Error('write failed'))
+    mutate.mockRejectedValueOnce(new Error('write failed'))
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request): Promise<Response> => requestPath(input) === OPENAI_CODEX_MODEL_CATALOG_PATH
       ? json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))
       : json({ status: 'signed-out' })))
@@ -630,7 +704,7 @@ describe('OpenAI Codex Plugin configuration card', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request): Promise<Response> => requestPath(input) === OPENAI_CODEX_MODEL_CATALOG_PATH
       ? json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))
       : json({ status: 'signed-out' })))
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
 
     render(<OpenAICodexSettings t={t} configScope={scope} embedded />)
     fireEvent.click(screen.getByRole('tab', { name: en.modelsModule }))
@@ -643,7 +717,7 @@ describe('OpenAI Codex Plugin configuration card', () => {
     expect((screen.getByRole('button', { name: en.save }) as HTMLButtonElement).disabled).toBe(false)
     fireEvent.click(screen.getByRole('tab', { name: en.modelsModule }))
     expect(model.checked).toBe(false)
-    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
   })
 
   it('disables capability edits when the Host settings document is read-only', async () => {
