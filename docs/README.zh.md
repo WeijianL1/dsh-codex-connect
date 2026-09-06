@@ -110,6 +110,7 @@ GPT Codex 对话的 Composer 会显示两个会话级控件：
 ### 搜索与图片工具
 
 - `enableSearch: true` 将 Codex 注册为可用搜索提供方，并用于整个 profile 的搜索。关闭时会注销该提供方，并恢复启用 Codex 搜索之前的路由。
+- 搜索从认证开始到读完响应共用 30 秒总期限。超过 1 MiB 的响应会被拒绝，失败时会取消尚未读完的响应体。调用方也可以提前取消搜索。
 - `enableImageTool: true` 为具备视觉能力的模型注册 `view_image`。远程读取只接受不带凭据的公网 HTTP(S)，并重新检查 DNS 与重定向。
 - `enableImageGeneration: true` 注册只接受提示词的 GPT Image 图片生成。使用你当前 GPT 订阅计划提供的图片生成能力。可用性、尺寸和额度仍由账户及服务端控制。
 
