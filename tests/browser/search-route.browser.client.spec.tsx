@@ -19,29 +19,31 @@ function translator(messages: Record<keyof typeof en, string>) {
   )
 }
 
-function configScope(): { scope: SettingsScope<OpenAICodexSettingsConfig>; set: ReturnType<typeof vi.fn> } {
+function configScope(): { scope: SettingsScope<OpenAICodexSettingsConfig>; mutate: ReturnType<typeof vi.fn> } {
   let snapshot: SettingsScopeSnapshot<OpenAICodexSettingsConfig> = {
     status: 'ready', value: { ...DEFAULT_OPENAI_CODEX_SETTINGS },
     base: DEFAULT_OPENAI_CODEX_SETTINGS, user: undefined, revision: 1, writable: true, mode: 'host',
   }
   const listeners = new Set<() => void>()
-  const set = vi.fn(async (field: keyof OpenAICodexSettingsConfig, value: unknown) => {
+  const mutate = vi.fn<SettingsScope<OpenAICodexSettingsConfig>['mutate']>(async (ops, revision) => {
+      if (revision !== snapshot.revision) throw new Error('stale revision')
       const currentUser = typeof snapshot.user === 'object' && snapshot.user !== null ? snapshot.user : {}
+      const changed = Object.fromEntries(ops.map(op => [op.path[0]!, op.op === 'set' ? op.value : undefined]))
       snapshot = {
         ...snapshot,
-        value: { ...snapshot.value ?? DEFAULT_OPENAI_CODEX_SETTINGS, [field]: value },
-        user: { ...currentUser, [field]: value },
+        value: { ...snapshot.value ?? DEFAULT_OPENAI_CODEX_SETTINGS, ...changed },
+        user: { ...currentUser, ...changed },
         revision: (snapshot.revision ?? 0) + 1,
       }
       for (const listener of listeners) listener()
     })
   return {
-    set,
+    mutate,
     scope: {
       getSnapshot: () => snapshot,
       subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener) } },
-      set,
-      unset: vi.fn(), mutate: vi.fn(),
+      set: vi.fn(async () => { throw new Error('Use an atomic mutation') }),
+      unset: vi.fn(), mutate,
     },
   }
 }
@@ -69,6 +71,6 @@ describe('Codex Search capability control', () => {
     await page.getByRole('button', { name: messages.save }).click()
 
     await expect.element(page.getByText(messages.settingsSaved, { exact: true })).toBeVisible()
-    expect(config.set).toHaveBeenCalledWith('enableSearch', true)
+    expect(config.mutate).toHaveBeenCalledWith([{ op: 'set', path: ['enableSearch'], value: true }], 1)
   })
 })

@@ -26,13 +26,16 @@ describe('Models account navigation', () => {
       user: undefined, revision: 0, writable: true, mode: 'host',
     }
     const listeners = new Set<() => void>()
-    const set = vi.fn(async (field: string, value: unknown) => {
-      snapshot = { ...snapshot, value: resolveOpenAICodexSettings({ ...snapshot.value!, [field]: value }), revision: (snapshot.revision ?? 0) + 1 }
+    const mutate = vi.fn<SettingsScope<OpenAICodexSettingsConfig>['mutate']>(async (ops, revision) => {
+      if (revision !== snapshot.revision) throw new Error('stale revision')
+      const next = { ...snapshot.value! }
+      for (const op of ops) Object.assign(next, { [op.path[0]!]: op.op === 'set' ? op.value : undefined })
+      snapshot = { ...snapshot, value: resolveOpenAICodexSettings(next), revision: (snapshot.revision ?? 0) + 1 }
       for (const listener of listeners) listener()
     })
     const scope: SettingsScope<OpenAICodexSettingsConfig> = {
       getSnapshot: () => snapshot, subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener) } },
-      set, unset: vi.fn(), mutate: vi.fn(),
+      set: vi.fn(async () => { throw new Error('Use an atomic mutation') }), unset: vi.fn(), mutate,
     }
     vi.stubGlobal('fetch', async (path: string) => Response.json(path === OPENAI_CODEX_MODEL_CATALOG_PATH
       ? modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }, { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' }])
@@ -64,14 +67,14 @@ describe('Models account navigation', () => {
       const sol = dialog.getByRole('checkbox', { name: /GPT-5\.6 Sol/u })
       await sol.click()
       await dialog.getByRole('button', { name: en.save, exact: true }).click()
-      await vi.waitFor(() => { expect(set).toHaveBeenCalledWith('models', ['gpt-5.6-luna']) })
+      await vi.waitFor(() => { expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['models'], value: ['gpt-5.6-luna'] }]), expect.any(Number)) })
       await dialog.getByRole('button', { name: en.closeSettings, exact: true }).click()
       await expect.element(more).toHaveFocus()
       const plugin = page.getByRole('region', { name: 'Plugin configuration' })
       await expect.element(plugin.getByRole('checkbox', { name: /GPT-5\.6 Sol/u })).not.toBeChecked()
       await plugin.getByRole('checkbox', { name: /GPT-5\.6 Sol/u }).click()
       await plugin.getByRole('button', { name: en.save, exact: true }).click()
-      await vi.waitFor(() => { expect(set).toHaveBeenCalledTimes(2) })
+      await vi.waitFor(() => { expect(mutate).toHaveBeenCalledTimes(2) })
       await more.click()
       await expect.element(sol).toBeChecked()
       await sol.click()
@@ -83,7 +86,7 @@ describe('Models account navigation', () => {
       await expect.element(more).toHaveFocus()
       await more.click()
       await expect.element(sol).toBeChecked()
-      expect(set).toHaveBeenCalledTimes(2)
+      expect(mutate).toHaveBeenCalledTimes(2)
       const modalModel = dialog.getByRole('group', { name: 'GPT-5.6 Sol', exact: true })
       await modalModel.getByRole('button', { name: en.contextAdjust, exact: true }).click()
       await modalModel.getByRole('spinbutton', { name: en.contextTokens }).fill('350000')
@@ -99,7 +102,7 @@ describe('Models account navigation', () => {
       await more.click()
       await modalModel.getByRole('button', { name: en.contextAdjust, exact: true }).click()
       await expect.element(modalModel.getByRole('spinbutton', { name: en.contextTokens })).toHaveValue(272_000)
-      expect(set).toHaveBeenCalledTimes(4)
+      expect(mutate).toHaveBeenCalledTimes(4)
       await dialog.getByRole('button', { name: en.closeSettings, exact: true }).click()
     } finally {
       document.removeEventListener('keydown', parentEscape)

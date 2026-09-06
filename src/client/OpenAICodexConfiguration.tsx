@@ -166,14 +166,6 @@ function sameField(
     && left.every((model, index) => model === right[index])
 }
 
-function sameConfig(
-  left: OpenAICodexSettingsConfig | undefined,
-  right: OpenAICodexSettingsConfig | undefined,
-): boolean {
-  return left !== undefined && right !== undefined
-    && CONFIG_FIELDS.every(field => sameField(field, left[field], right[field]))
-}
-
 /** Edit the Host-owned llm-openai-codex settings section with Save/Discard staging. */
 export function OpenAICodexConfiguration({ scope, t, activeModule, panelIdPrefix }: OpenAICodexConfigurationProps) {
   const subscribe = useCallback((listener: () => void) => scope?.subscribe(listener) ?? (() => undefined), [scope])
@@ -184,6 +176,7 @@ export function OpenAICodexConfiguration({ scope, t, activeModule, panelIdPrefix
     getSnapshot,
   )
   const [draft, setDraft] = useState<OpenAICodexSettingsConfig | undefined>(snapshot.value)
+  const baseline = useRef(snapshot.value)
   const [dirty, setDirty] = useState(false)
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState<'idle' | 'saved' | 'error'>('idle')
@@ -225,6 +218,7 @@ export function OpenAICodexConfiguration({ scope, t, activeModule, panelIdPrefix
 
   useEffect(() => {
     if (!dirty && !busy) {
+      baseline.current = snapshot.value
       setDraft(snapshot.value)
       setManualProxyUrl(snapshot.value?.proxyUrl ?? '')
     }
@@ -403,21 +397,28 @@ export function OpenAICodexConfiguration({ scope, t, activeModule, panelIdPrefix
     setBusy(true)
     setFeedback('idle')
     try {
-      for (const field of CONFIG_FIELDS) {
-        const accepted = scope.getSnapshot().value
-        if (accepted !== undefined && sameField(field, accepted[field], desired[field])) continue
+      const current = scope.getSnapshot()
+      const original = baseline.current
+      if (current.value === undefined || original === undefined || current.revision === undefined) {
+        throw new Error('Host settings are unavailable')
+      }
+      const changed = CONFIG_FIELDS.filter(field => !sameField(field, original[field], desired[field]))
+      const ops: Parameters<SettingsScope<OpenAICodexSettingsConfig>['mutate']>[0] = changed.map(field => {
+        if (!sameField(field, original[field], current.value![field])
+          && !sameField(field, desired[field], current.value![field])) {
+          throw new Error(`Concurrent change to ${field}`)
+        }
         // Null masks prevent a reset row from silently re-inheriting a composition override.
         const value = field === 'contextWindowOverrides'
           ? { ...Object.fromEntries((modelCatalog ?? []).map(model => [model.id, null])), ...desired.contextWindowOverrides }
           : desired[field]
-        await scope.set(field, value)
-        const committed = scope.getSnapshot().value
-        if (committed === undefined || !sameField(field, committed[field], desired[field])) {
-          throw new Error(`Host refused ${field}`)
-        }
-      }
+        return value === undefined ? { op: 'unset', path: [field] } : { op: 'set', path: [field], value }
+      })
+      if (ops.length > 0) await scope.mutate(ops, current.revision)
       const accepted = scope.getSnapshot().value
-      if (!sameConfig(accepted, desired)) throw new Error('Host returned a different configuration')
+      if (accepted === undefined || changed.some(field => !sameField(field, accepted[field], desired[field]))) {
+        throw new Error('Host refused the configuration change')
+      }
       setDraft(accepted)
       setDirty(false)
       setFeedback('saved')

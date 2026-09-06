@@ -23,7 +23,7 @@ function t(key: keyof typeof en, params: Record<string, unknown> = {}): string {
 
 function settingsScopeFixture(initial: Partial<OpenAICodexSettingsConfig> = {}, writable = true): {
   scope: SettingsScope<OpenAICodexSettingsConfig>
-  set: ReturnType<typeof vi.fn>
+  mutate: ReturnType<typeof vi.fn>
 } {
   let snapshot: SettingsScopeSnapshot<OpenAICodexSettingsConfig> = {
     status: 'ready',
@@ -35,22 +35,25 @@ function settingsScopeFixture(initial: Partial<OpenAICodexSettingsConfig> = {}, 
     mode: 'host',
   }
   const listeners = new Set<() => void>()
-  const set = vi.fn(async (field: string, value: unknown) => {
+  const mutate = vi.fn<SettingsScope<OpenAICodexSettingsConfig>['mutate']>(async (ops, revision) => {
+    if (revision !== snapshot.revision) throw new Error('stale revision')
     const current = snapshot.value
     if (current === undefined) throw new Error('settings unavailable')
-    snapshot = { ...snapshot, value: resolveOpenAICodexSettings({ ...current, [field]: value }), revision: (snapshot.revision ?? 0) + 1 }
+    const next = { ...current }
+    for (const op of ops) Object.assign(next, { [op.path[0]!]: op.op === 'set' ? op.value : undefined })
+    snapshot = { ...snapshot, value: resolveOpenAICodexSettings(next), revision: (snapshot.revision ?? 0) + 1 }
     for (const listener of listeners) listener()
   })
   return {
-    set,
+    mutate,
     scope: {
       getSnapshot: () => snapshot,
       subscribe(listener) {
         listeners.add(listener)
         return () => { listeners.delete(listener) }
       },
-      set,
-      mutate: vi.fn(async () => { throw new Error('This fixture supports single-field settings writes only.') }),
+      set: vi.fn(async () => { throw new Error('Use an atomic mutation') }),
+      mutate,
       unset: vi.fn(async () => undefined),
     },
   }
@@ -77,7 +80,7 @@ afterEach(() => {
 describe('Codex model visibility in Chromium', () => {
   it('keeps staged changes and actions while switching settings modules', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     root.render(createElement(OpenAICodexConfiguration, { scope, t }))
     const model = page.getByRole('checkbox', { name: /GPT-5\.6 Sol/u })
     await model.click()
@@ -89,7 +92,7 @@ describe('Codex model visibility in Chromium', () => {
     await expect.element(model).not.toBeChecked()
     await page.getByRole('button', { name: en.discard, exact: true }).click()
     await expect.element(model).toBeChecked()
-    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
   })
 
   it('keeps the label and numeric input on one row, the limit on the next and the slider full-width', async () => {
@@ -121,13 +124,13 @@ describe('Codex model visibility in Chromium', () => {
   it('stages per-model budgets, preserves hidden models, discards edits and resets without changing other budgets', async () => {
     const models = [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }, { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra' }]
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(modelCatalogFixture(models)))))
-    const { scope, set } = settingsScopeFixture({ contextWindowOverrides: { 'gpt-5.6-sol': 300_000, 'gpt-5.6-terra': 340_000 } })
+    const { scope, mutate } = settingsScopeFixture({ contextWindowOverrides: { 'gpt-5.6-sol': 300_000, 'gpt-5.6-terra': 340_000 } })
     root.render(createElement(OpenAICodexConfiguration, { scope, t }))
     const sol = page.getByRole('group', { name: 'GPT-5.6 Sol', exact: true })
     await sol.getByRole('button', { name: en.contextAdjust, exact: true }).click()
     const input = sol.getByRole('spinbutton', { name: en.contextTokens })
     await input.fill('350000')
-    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
     await page.getByRole('button', { name: en.discard, exact: true }).click()
     await vi.waitFor(() => { expect((input.element() as HTMLInputElement).value).toBe('300000') })
     await input.fill('350000')
@@ -139,7 +142,7 @@ describe('Codex model visibility in Chromium', () => {
     await sol.getByRole('button', { name: en.contextReset, exact: true }).click()
     await page.getByRole('button', { name: en.save, exact: true }).click()
     await vi.waitFor(() => {
-      expect(set).toHaveBeenCalledWith('contextWindowOverrides', { 'gpt-5.6-sol': null, 'gpt-5.6-terra': 340_000 })
+      expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['contextWindowOverrides'], value: { 'gpt-5.6-sol': null, 'gpt-5.6-terra': 340_000 } }]), expect.any(Number))
       expect(scope.getSnapshot().value?.contextWindowOverrides).toEqual({ 'gpt-5.6-terra': 340_000 })
       expect((input.element() as HTMLInputElement).value).toBe('272000')
     })
@@ -150,7 +153,7 @@ describe('Codex model visibility in Chromium', () => {
 
   it('blocks empty, fractional, nonpositive and unsafe budgets, and leaves restoring defaults explicit', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     root.render(createElement(OpenAICodexConfiguration, { scope, t }))
     await page.getByRole('button', { name: en.contextAdjust, exact: true }).click()
     const input = page.getByRole('spinbutton', { name: en.contextTokens })
@@ -162,7 +165,7 @@ describe('Codex model visibility in Chromium', () => {
         expect(input.element().getAttribute('aria-invalid')).toBe('true')
       })
     }
-    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
     await page.getByRole('button', { name: en.contextReset, exact: true }).click()
     await page.getByRole('button', { name: en.save, exact: true }).click()
     expect(scope.getSnapshot().value?.contextWindowOverrides).toBeUndefined()
@@ -170,17 +173,17 @@ describe('Codex model visibility in Chromium', () => {
 
   it('does not allow editing budgets in a read-only scope', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
-    const { scope, set } = settingsScopeFixture({}, false)
+    const { scope, mutate } = settingsScopeFixture({}, false)
     root.render(createElement(OpenAICodexConfiguration, { scope, t }))
     await vi.waitFor(() => {
       expect(page.getByRole('button', { name: en.contextAdjust, exact: true }).element().matches(':disabled')).toBe(true)
     })
-    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
   })
 
   it('discloses Auto-review details and asks once before the first profile enablement', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     root.render(createElement(OpenAICodexConfiguration, { scope, t }))
     await page.getByRole('tab', { name: en.capabilitiesModule, exact: true }).click()
     const checkbox = page.getByRole('checkbox', { name: /Codex Auto-review/u })
@@ -202,8 +205,8 @@ describe('Codex model visibility in Chromium', () => {
     await expect.element(checkbox).toBeChecked()
     await page.getByRole('button', { name: en.save, exact: true }).click()
     await vi.waitFor(() => {
-      expect(set).toHaveBeenCalledWith('autoReviewDisclosureAcknowledged', true)
-      expect(set).toHaveBeenCalledWith('enableAutoReview', true)
+      expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['autoReviewDisclosureAcknowledged'], value: true }]), expect.any(Number))
+      expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['enableAutoReview'], value: true }]), expect.any(Number))
     })
 
     await checkbox.click()
@@ -223,7 +226,7 @@ describe('Codex model visibility in Chromium', () => {
       expect(String(input)).toBe(OPENAI_CODEX_MODEL_CATALOG_PATH)
       return new Response(JSON.stringify(modelCatalogFixture(models)), { status: 200, headers: { 'content-type': 'application/json' } })
     })
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     vi.stubGlobal('fetch', fetchMock)
     root.render(createElement(OpenAICodexConfiguration, { scope, t }))
 
@@ -232,7 +235,7 @@ describe('Codex model visibility in Chromium', () => {
     await sol.click()
     await page.getByRole('button', { name: en.save }).click()
     await vi.waitFor(() => {
-      expect(set).toHaveBeenCalledWith('models', ['gpt-5.6-luna', 'gpt-5.6-terra'])
+      expect(mutate).toHaveBeenCalledWith(expect.arrayContaining([{ op: 'set', path: ['models'], value: ['gpt-5.6-luna', 'gpt-5.6-terra'] }]), expect.any(Number))
     })
 
     await page.viewport(360, 800)
@@ -244,7 +247,7 @@ describe('Codex model visibility in Chromium', () => {
 
   it('synchronizes pointer and keyboard slider edits with exact input, warns above default and restores the numeric default', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }]))))
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     root.render(createElement(OpenAICodexConfiguration, { scope, t }))
     const sol = page.getByRole('group', { name: 'GPT-5.6 Sol', exact: true })
     await expect.element(sol).toHaveTextContent('272,000 tokens')
@@ -265,7 +268,7 @@ describe('Codex model visibility in Chromium', () => {
     await expect.element(input).toHaveValue(872_000)
     await userEvent.keyboard('{ArrowLeft}')
     await expect.element(input).toHaveValue(871_999)
-    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
     await page.getByRole('button', { name: en.save, exact: true }).click()
     expect(scope.getSnapshot().value?.contextWindowOverrides).toEqual({ 'gpt-5.6-sol': 871_999 })
     await sol.getByRole('button', { name: en.contextReset, exact: true }).click()
@@ -307,7 +310,7 @@ describe('Codex model visibility in Chromium', () => {
       const proxyUrl = new URL(value, window.location.href).searchParams.get('proxyUrl') ?? ''
       return Response.json({ proxyUrl, reachable: true, classification: 'reachable', status: 401 })
     }))
-    const { scope, set } = settingsScopeFixture()
+    const { scope, mutate } = settingsScopeFixture()
     root.render(createElement(OpenAICodexConfiguration, { scope, t }))
     await page.getByRole('tab', { name: en.networkModule, exact: true }).click()
     await page.viewport(360, 800)
@@ -324,7 +327,7 @@ describe('Codex model visibility in Chromium', () => {
     await page.getByRole('button', { name: en.useThisProxy, exact: true }).click()
     await expect.element(page.getByText(en.selectedProxy, { exact: true }).first()).toBeVisible()
     await expect.element(page.getByText(en.pendingProxy.replace('{proxyUrl}', candidate), { exact: true })).toBeVisible()
-    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
 
     await page.getByRole('tab', { name: en.manualEntry, exact: true }).click()
     expect(automaticPanel.hidden).toBe(true)
