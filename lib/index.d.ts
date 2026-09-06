@@ -67,6 +67,8 @@ declare class OpenAICodexCredentialStore implements CredentialStore {
   modify(providerId: string, fn: (current: Credential | undefined) => Promise<Credential | undefined>, options?: Parameters<CredentialStore['modify']>[2]): Promise<Credential | undefined>;
   /** @inheritdoc */
   delete(providerId: string): Promise<void>;
+  /** Allow the provider's 15-second refresh plus bounded filesystem completion. */
+  private withWriterLock;
 }
 //#endregion
 //#region src/provider-proxy.d.ts
