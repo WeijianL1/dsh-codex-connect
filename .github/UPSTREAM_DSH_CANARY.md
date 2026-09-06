@@ -12,6 +12,8 @@ The tracker contains public package versions, the plugin commit, Node.js version
 
 ## Response procedure
 
+Summary redaction recognizes the runtime home directory, Linux root homes, Windows drive paths and UNC paths. Repository and temporary-directory markers take precedence over home-directory redaction. Proxy candidate tests isolate all six uppercase and lowercase HTTP, HTTPS and ALL proxy variables from the invoking environment.
+
 1. Open the canonical candidate tracker and linked workflow run. Record the candidate version, current state, plugin commit, stage, and bounded summary.
 2. Reproduce the exact version with `DSH_VERSION=<reported-version> DSH_UNDECLARED_CANARY_VERSION=1 node scripts/check-dsh-install.mjs` from the reported commit. Stop after two identical failures and investigate the upstream change instead of retrying repeatedly.
 3. Use the reported channel to set urgency. An `alpha` or `next` failure is an early warning; an unsupported `latest` release can affect new DSH installations. Channel names do not establish version ordering, so the canary compares the resolved semantic versions before installation.

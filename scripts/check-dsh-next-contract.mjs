@@ -153,6 +153,11 @@ assertContract('credential-bearing environment is removed', scrubbedEnvironment.
 const sanitized = sanitizeSummary(`${process.cwd()}/secret\n${process.env.HOME}/private\na.b.c`)
 assertContract('repository paths are redacted', !sanitized.includes(process.cwd()) && sanitized.includes('<repository>'))
 assertContract('home paths are redacted', process.env.HOME === undefined || !sanitized.includes(process.env.HOME))
+for (const localPath of ['/root/private/file', 'C:\\Users\\Fixture User\\private.txt', 'D:/Profiles/fixture/private.txt', '\\\\fixture-host\\share\\private.txt']) {
+  assertContract(`portable path is redacted: ${localPath}`, !sanitizeSummary(localPath).includes(localPath))
+}
+assertContract('nonstandard home paths are redacted', sanitizeSummary('/srv/fixture-user/private/file', '/srv/fixture-user') === '<local-path>')
+assertContract('bare home in a diagnostic is redacted', !sanitizeSummary('/srv/fixture-user: permission denied', '/srv/fixture-user').includes('/srv/fixture-user'))
 
 const compatibilityFailure = version => ({
   status: 'fail',

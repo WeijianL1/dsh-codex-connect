@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -118,12 +118,16 @@ export function parseRegistryDistTags(output) {
   return distTags
 }
 
-export function sanitizeSummary(value) {
+export function sanitizeSummary(value, homeDirectory = homedir()) {
   const lines = value.trim().split(/\r?\n/u).slice(-12).join('\n')
-  return lines
     .replaceAll(REPO_ROOT, '<repository>')
     .replaceAll(tmpdir(), '<temporary-directory>')
-    .replace(/\/(?:Users|home)\/[^\s:'"]+/gu, '<local-path>')
+  const localHome = homeDirectory.length > 1 ? homeDirectory.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&') : undefined
+  const withoutHome = localHome === undefined ? lines : lines.replace(new RegExp(`${localHome}(?=[\\\\/\\s:'"]|$)[^\\r\\n'"]*`, 'giu'), '<local-path>')
+  return withoutHome
+    .replace(/\/(?:root\b|(?:Users|home)\/[^/\s:'"]+)[^\s:'"]*/gu, '<local-path>')
+    .replace(/\b[A-Za-z]:[\\/][^\r\n'"]+/gu, '<local-path>')
+    .replace(/\\\\[^\r\n'"]+/gu, '<local-path>')
     .replace(/[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/gu, '<redacted-token>')
     .slice(0, MAX_SUMMARY_LENGTH)
 }
