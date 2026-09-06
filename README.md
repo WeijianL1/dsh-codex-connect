@@ -75,6 +75,8 @@ The Models card and the Plugin configuration page share the same account state. 
 - Removing the active account requires selecting a replacement when another account remains. Removing the last account signs out; **Sign out all accounts** deletes all locally stored Codex credentials.
 - Codex Connect does not rotate accounts automatically or fail over when a request is rejected.
 
+Credential changes wait up to 20 seconds for the writer lock, allowing an in-progress token refresh to finish. A lock timeout fails the operation without deleting another writer's lock or changing stored accounts. A lock left behind by a crashed process requires operator recovery after confirming that no writer is running.
+
 For GPT Codex conversations, the Composer shows two session controls:
 
 - **Fast Mode** requests the faster `1.5×` mode for that conversation only. It is off by default and does not change the model.

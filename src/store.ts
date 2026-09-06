@@ -286,7 +286,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
     options?: Parameters<CredentialStore['modify']>[2],
   ): Promise<StoredOAuthCredential | undefined> {
     await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
-    return withFileLock(this.filename, async () => {
+    return this.withWriterLock(async () => {
       const document = await this.readDocument()
       if (document === undefined) return undefined
       const credentials = [...documentCredentials(document)]
@@ -343,7 +343,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
   /** Select a stored account using its browser-safe key. */
   async activate(selectedAccountKey: string): Promise<OAuthCredential> {
     await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
-    return withFileLock(this.filename, async () => {
+    return this.withWriterLock(async () => {
       const document = await this.readDocument()
       if (document === undefined) throw new Error('openai-codex: account not found')
       const credentials = documentCredentials(document)
@@ -361,7 +361,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
   /** Remove one account; active removal requires an explicit stored replacement. */
   async removeAccount(selectedAccountKey: string, replacementAccountKey?: string): Promise<void> {
     await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
-    await withFileLock(this.filename, async () => {
+    await this.withWriterLock(async () => {
       const document = await this.readDocument()
       if (document === undefined) throw new Error('openai-codex: account not found')
       const credentials = [...documentCredentials(document)]
@@ -405,7 +405,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
       throw new Error(`openai-codex: credential store does not own provider "${providerId}"`)
     }
     await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
-    return withFileLock(this.filename, async () => {
+    return this.withWriterLock(async () => {
       const currentDocument = await this.readDocument()
       const current = currentDocument === undefined ? undefined : cloneCredential(activeCredential(currentDocument))
       // pi-ai treats invocation of fn as the commit point and waits for its result.
@@ -433,9 +433,14 @@ export class OpenAICodexCredentialStore implements CredentialStore {
   async delete(providerId: string): Promise<void> {
     if (providerId !== OPENAI_CODEX_PROVIDER) return
     await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
-    await withFileLock(this.filename, async () => {
+    await this.withWriterLock(async () => {
       await rm(this.filename, { force: true })
       await rm(this.version1BackupFilename, { force: true })
     })
+  }
+
+  /** Allow the provider's 15-second refresh plus bounded filesystem completion. */
+  private withWriterLock<T>(operation: () => Promise<T>): Promise<T> {
+    return withFileLock(this.filename, operation, { waitMs: 20_000 })
   }
 }
