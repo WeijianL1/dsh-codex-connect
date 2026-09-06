@@ -1,4 +1,5 @@
 import { readFile, stat } from 'node:fs/promises'
+import './vendor-codex-oauth.mjs'
 
 const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
 const failures = []

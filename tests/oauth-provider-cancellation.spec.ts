@@ -14,7 +14,8 @@ it('settles cancellation and expiry through the installed pi-ai browser OAuth im
   // Keep the real OAuth state machine, but never bind its fixed callback port or contact OpenAI.
   class CallbackServer extends EventEmitter {
     listen(_port: number, _host: string, ready: () => void) { queueMicrotask(ready); return this }
-    close() { closed++; return this }
+    close(callback?: () => void) { closed++; callback?.(); return this }
+    closeAllConnections() { return this }
   }
   const server = vi.spyOn(http, 'createServer').mockImplementation(() => new CallbackServer() as unknown as Server)
   syncBuiltinESMExports()
