@@ -151,7 +151,7 @@ describe('OpenAI Codex proxy manager', () => {
     const fallback = new RecordingDispatcher()
     setGlobalDispatcher(fallback)
     const dispatch = vi.spyOn(ProxyAgent.prototype, 'dispatch').mockReturnValue(true)
-    const close = vi.spyOn(ProxyAgent.prototype, 'close').mockResolvedValue()
+    const close = vi.spyOn(ProxyAgent.prototype, 'destroy').mockResolvedValue()
     const manager = new OpenAICodexProxyManager()
 
     manager.run(DEFAULT_OPENAI_CODEX_PROXY_URL, () => {

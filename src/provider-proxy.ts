@@ -180,33 +180,77 @@ export function listOpenAICodexProxyCandidates(): readonly string[] {
 /** One plugin instance owns its proxy agents and contributes one global wrapper owner. */
 export class OpenAICodexProxyManager {
   private readonly agents = new Map<string, ProxyAgent>()
+  private readonly connections = new Map<ProxyAgent, AbortController>()
   private activeOperations = 0
   private idleWaiters: Array<() => void> = []
   private disposed = false
   private disposePromise: Promise<void> | undefined
+  private closing: Promise<void> | undefined
 
   private async waitForIdle(): Promise<void> {
     if (this.activeOperations === 0) return
-    await new Promise<void>(resolve => { this.idleWaiters.push(resolve) })
+    await new Promise<void>(resolve => {
+      const finish = () => {
+        clearTimeout(timer)
+        this.idleWaiters = this.idleWaiters.filter(waiter => waiter !== finish)
+        resolve()
+      }
+      const timer = setTimeout(finish, 1_000)
+      this.idleWaiters.push(finish)
+    })
   }
 
   private async closeAgents(): Promise<void> {
     removeOwner(this)
     const agents = [...this.agents.values()]
     this.agents.clear()
-    await Promise.allSettled(agents.map(agent => agent.close()))
+    for (const agent of agents) {
+      this.connections.get(agent)?.abort()
+      this.connections.delete(agent)
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        Promise.allSettled(agents.map(agent => agent.destroy())),
+        new Promise<void>(resolve => { timer = setTimeout(resolve, 1_000) }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private async shutdown(): Promise<void> {
+    if (this.closing !== undefined) return this.closing
+    const closing = (async () => {
+      await this.waitForIdle()
+      await this.closeAgents()
+    })()
+    this.closing = closing
+    try { await closing } finally {
+      if (this.closing === closing) this.closing = undefined
+    }
   }
 
   private agentFor(proxyUrl: string): ProxyAgent {
     let agent = this.agents.get(proxyUrl)
     if (agent !== undefined) return agent
-    agent = new UndiciProxyAgent({ uri: proxyUrl, proxyTunnel: true })
+    const connection = new AbortController()
+    // Node accepts a socket abort signal; its TLS options omit that inherited field.
+    const connectionOptions = { signal: connection.signal, rejectUnauthorized: true }
+    agent = new UndiciProxyAgent({
+      uri: proxyUrl,
+      proxyTunnel: true,
+      requestTls: connectionOptions,
+      proxyTls: connectionOptions,
+    })
+    this.connections.set(agent, connection)
     this.agents.set(proxyUrl, agent)
     return agent
   }
 
   private acquire(proxyUrl: string): { agent: ProxyAgent; release: () => void } {
     if (this.disposed) throw new Error('OpenAI Codex proxy manager has been disposed')
+    if (this.closing !== undefined) throw new Error('OpenAI Codex proxy manager is shutting down')
     ensureInstalled(this)
     this.activeOperations += 1
     let released = false
@@ -254,7 +298,7 @@ export class OpenAICodexProxyManager {
     const lease = this.acquire(normalized)
     try {
       const stream = proxyScope.run(lease.agent, operation)
-      void Promise.resolve(stream.result()).finally(lease.release)
+      void Promise.resolve(stream.result()).then(lease.release, lease.release)
       return stream
     } catch (error: unknown) {
       lease.release()
@@ -291,22 +335,18 @@ export class OpenAICodexProxyManager {
     }
   }
 
-  /** Close owned pools only after all scoped operations have become quiescent. */
+  /** Allow one second to drain, then destroy owned pools with a one-second completion bound. */
   async dispose(): Promise<void> {
     if (this.disposePromise !== undefined) return this.disposePromise
     this.disposed = true
-    this.disposePromise = (async () => {
-      await this.waitForIdle()
-      await this.closeAgents()
-    })()
+    this.disposePromise = this.shutdown()
     return this.disposePromise
   }
 
-  /** Release the process wrapper and pools after the user disables the proxy. */
+  /** Bound shutdown as on disposal; reject new proxy leases until reconfiguration finishes. */
   async deactivate(): Promise<void> {
     if (this.disposed) return
-    await this.waitForIdle()
-    await this.closeAgents()
+    await this.shutdown()
   }
 }
 
