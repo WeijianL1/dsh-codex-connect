@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/pr
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { OAuthCredential } from '@earendil-works/pi-ai'
+import type { CredentialStore, OAuthCredential } from '@earendil-works/pi-ai'
 import {
   OpenAICodexCredentialStore,
   OPENAI_CODEX_ACCOUNT_LIMIT,
@@ -33,6 +33,41 @@ async function store(): Promise<OpenAICodexCredentialStore> {
 }
 
 describe('OpenAICodexCredentialStore', () => {
+  it.each(['active', 'captured'] as const)('does not mutate the %s store after cancellation while another writer holds the real file lock', async (kind) => {
+    const auth = await store()
+    await auth.modify(OPENAI_CODEX_PROVIDER, async () => credential('a', 'account-a'))
+    const target: CredentialStore = kind === 'active' ? auth : await auth.captureActiveAccount()
+    let release!: () => void
+    let entered!: () => void
+    const holding = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const writer = auth.modify(OPENAI_CODEX_PROVIDER, async () => { entered(); await gate; return undefined })
+    await holding
+    const abort = new AbortController()
+    let called = false
+    const queued = target.modify(OPENAI_CODEX_PROVIDER, async () => {
+      called = true
+      return credential('b', 'account-a')
+    }, { signal: abort.signal }).then(() => 'committed', () => 'cancelled')
+    abort.abort()
+    release()
+    await writer
+    expect(await queued).toBe('cancelled')
+    expect(called).toBe(false)
+    expect(await auth.read(OPENAI_CODEX_PROVIDER)).toMatchObject({ access: 'a', accountId: 'account-a' })
+    expect(await target.read(OPENAI_CODEX_PROVIDER)).toMatchObject({ access: 'a', accountId: 'account-a' })
+  })
+
+  it('awaits a mutation already started when cancellation arrives', async () => {
+    const auth = await store()
+    const abort = new AbortController()
+    const result = await (auth as CredentialStore).modify(OPENAI_CODEX_PROVIDER, async () => {
+      abort.abort()
+      return credential('b', 'account-b')
+    }, { signal: abort.signal })
+    expect(result).toMatchObject({ accountId: 'account-b' })
+    expect(await auth.read(OPENAI_CODEX_PROVIDER)).toEqual(result)
+  })
   it('persists, lists, detaches, and removes all OAuth credentials owner-only', async () => {
     const auth = await store()
     expect(await auth.read(OPENAI_CODEX_PROVIDER)).toBeUndefined()
