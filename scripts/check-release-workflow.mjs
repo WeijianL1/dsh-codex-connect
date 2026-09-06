@@ -81,6 +81,7 @@ assertContract('post-publish version and alpha tag verification is retried',
 assertContract('GitHub prerelease is created from the workflow SHA',
   /gh release create[\s\S]*?--prerelease[\s\S]*?--target "\$GITHUB_SHA"[\s\S]*?--generate-notes/.test(workflow))
 assertContract('workflow never promotes the latest dist-tag', !/npm dist-tag add/.test(workflow))
+assertContract('CI also covers dependent PR bases', /pull_request:\s*\n\s{2}workflow_dispatch:/.test(ciWorkflow))
 assertContract('package check invokes this contract', packageJson.scripts?.['check:release-workflow'] === 'node scripts/check-release-workflow.mjs')
 assertContract('full check includes the release contract', /(?:^|&&)\s*pnpm run check:release-workflow(?:\s|$)/.test(packageJson.scripts?.check ?? ''))
 
