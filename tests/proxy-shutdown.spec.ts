@@ -1,6 +1,7 @@
 import { createServer } from 'node:http'
 import { type AddressInfo, type Socket } from 'node:net'
 import { expect, it, vi } from 'vitest'
+import { Dispatcher, getGlobalDispatcher, setGlobalDispatcher } from 'undici'
 import { OpenAICodexProxyManager } from '../src/provider-proxy.ts'
 
 it('bounds disposal even if a scoped operation never settles', async () => {
@@ -75,4 +76,37 @@ it('rejects new leases while deactivating and permits a fresh pool afterwards', 
   await closing
   expect(manager.run('http://127.0.0.1:9', () => 'new lease')).toBe('new lease')
   await manager.dispose()
+})
+
+it('does not let a late callback bypass its destroyed proxy through the host dispatcher', async () => {
+  vi.useFakeTimers()
+  const previous = getGlobalDispatcher()
+  let directCalls = 0
+  class HostDispatcher extends Dispatcher {
+    dispatch(): boolean { directCalls++; throw new Error('Unexpected direct request') }
+  }
+  const host = new HostDispatcher()
+  setGlobalDispatcher(host)
+  const manager = new OpenAICodexProxyManager()
+  let release!: () => void
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  const operation = manager.run('http://127.0.0.1:9', async () => {
+    await waiting
+    return fetch('http://example.invalid/')
+  }).then(() => 'resolved', () => 'rejected')
+  try {
+    const disposal = manager.dispose()
+    await vi.advanceTimersByTimeAsync(3_000)
+    await disposal
+    release()
+    expect(await operation).toBe('rejected')
+    expect(directCalls).toBe(0)
+    expect(getGlobalDispatcher()).toBe(host)
+  } finally {
+    release()
+    await operation
+    await manager.dispose()
+    setGlobalDispatcher(previous)
+    vi.useRealTimers()
+  }
 })

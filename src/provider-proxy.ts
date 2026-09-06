@@ -201,7 +201,8 @@ export class OpenAICodexProxyManager {
   }
 
   private async closeAgents(): Promise<void> {
-    removeOwner(this)
+    // Late callbacks must still dispatch through their destroyed pool, never directly.
+    if (this.activeOperations === 0) removeOwner(this)
     const agents = [...this.agents.values()]
     this.agents.clear()
     for (const agent of agents) {
@@ -261,6 +262,7 @@ export class OpenAICodexProxyManager {
         released = true
         this.activeOperations -= 1
         if (this.activeOperations === 0) {
+          if (this.agents.size === 0) removeOwner(this)
           for (const resolve of this.idleWaiters.splice(0)) resolve()
         }
       },
