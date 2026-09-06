@@ -5,31 +5,17 @@ import { createRequire } from 'node:module'
 type UndiciModule = typeof import('undici')
 
 const LEGACY_GLOBAL_DISPATCHER = Symbol.for('undici.globalDispatcher.1')
-const CURRENT_GLOBAL_DISPATCHER = Symbol.for('undici.globalDispatcher.2')
-
-function isDispatcher(value: unknown): value is { dispatch: (...args: unknown[]) => unknown } {
-  return typeof value === 'object'
-    && value !== null
-    && 'dispatch' in value
-    && typeof value.dispatch === 'function'
-}
-
 const inheritedDispatcher = Reflect.get(globalThis, LEGACY_GLOBAL_DISPATCHER)
-const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '', 10)
-const isNodeEnvironmentProxy = nodeMajor >= 24
-  && isDispatcher(inheritedDispatcher)
-  && inheritedDispatcher.constructor.name === 'EnvHttpProxyAgent'
-if (Reflect.get(globalThis, CURRENT_GLOBAL_DISPATCHER) === undefined && isNodeEnvironmentProxy) {
-  Reflect.defineProperty(globalThis, CURRENT_GLOBAL_DISPATCHER, {
-    value: inheritedDispatcher,
-    writable: true,
-    enumerable: false,
-    configurable: false,
-  })
-}
-
+// Node lazily initializes its own Undici when a provider reads WebSocket.
+// Include that initialization in the same preservation window as npm Undici.
+void globalThis.WebSocket
 const require = createRequire(import.meta.url)
 const undici = require('undici') as UndiciModule
+// Undici initializes a v2 dispatcher and its v1 bridge. A host v1 dispatcher
+// must stay on the v1 protocol; it cannot be assigned to the v2 slot.
+if (inheritedDispatcher !== undefined) {
+  Reflect.set(globalThis, LEGACY_GLOBAL_DISPATCHER, inheritedDispatcher)
+}
 
 /** Undici dispatcher base loaded after preserving Node's dispatcher. */
 export const Dispatcher = undici.Dispatcher

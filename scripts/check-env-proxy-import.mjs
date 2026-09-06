@@ -54,3 +54,47 @@ if (child.status !== 0) {
 }
 
 process.stdout.write(`environment proxy import: ${child.stdout}\n`)
+
+const custom = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+const symbol = Symbol.for('undici.globalDispatcher.1')
+const custom = {
+  dispatch(options, handler) {
+    handler.onConnect(() => {})
+    handler.onHeaders(200, ['content-type', 'text/plain'], () => {}, 'OK')
+    handler.onData(Buffer.from('host-policy'))
+    handler.onComplete([])
+    return true
+  }
+}
+Object.defineProperty(globalThis, symbol, { value: custom, writable: true })
+const plugin = await import(process.argv[1])
+if (globalThis[symbol] !== custom) throw new Error('import replaced custom v1 dispatcher')
+const manager = new plugin.OpenAICodexProxyManager()
+manager.run('http://127.0.0.1:9', () => undefined)
+const legacyBody = await new Promise((resolve, reject) => {
+  let body = ''
+  globalThis[symbol].dispatch({}, {
+    onConnect() {}, onHeaders() {}, onData(chunk) { body += chunk },
+    onComplete() { resolve(body) }, onError: reject,
+  })
+})
+if (legacyBody !== 'host-policy') {
+  throw new Error('unrelated fetch lost host policy')
+}
+// Node 26 native fetch uses v2; older supported Nodes consume the v1 slot.
+if (Number(process.versions.node.split('.')[0]) < 26
+  && await (await fetch('http://fixture.invalid')).text() !== 'host-policy') {
+  throw new Error('native fetch lost host v1 policy')
+}
+const replacement = { ...custom }
+globalThis[symbol] = replacement
+manager.run('http://127.0.0.1:9', () => undefined)
+await manager.dispose()
+if (globalThis[symbol] !== replacement) throw new Error('dispose replaced third-party v1 dispatcher')
+process.stdout.write('custom v1 import, unrelated fetch and ownership passed')
+`, packageEntry], { encoding: 'utf8', timeout: 10_000 })
+if (custom.status !== 0) {
+  process.stderr.write(custom.stderr)
+  process.exit(custom.status ?? 1)
+}
+process.stdout.write(`${custom.stdout}\n`)

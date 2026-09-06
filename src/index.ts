@@ -4,6 +4,7 @@
  * @module dsh-codex-connect
  */
 
+import './undici-runtime.ts'
 import type { Context, Fiber } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'

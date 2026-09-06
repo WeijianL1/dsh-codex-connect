@@ -33,6 +33,39 @@ afterEach(async () => {
 })
 
 describe('OpenAI Codex proxy manager', () => {
+  it('does not form a dispatch cycle when a third-party wrapper retains the prior dispatcher', async () => {
+    const original = new RecordingDispatcher()
+    setGlobalDispatcher(original)
+    const manager = new OpenAICodexProxyManager()
+    manager.run('http://127.0.0.1:9', () => undefined)
+    const retained = getGlobalDispatcher()
+    class ThirdParty extends Dispatcher {
+      dispatch(options: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+        return retained.dispatch(options, handler)
+      }
+    }
+    const replacement = new ThirdParty()
+    setGlobalDispatcher(replacement)
+    try {
+      manager.run('http://127.0.0.1:9', () => undefined)
+      getGlobalDispatcher().dispatch({ origin: 'http://fixture.invalid', path: '/', method: 'GET' }, {} as Dispatcher.DispatchHandler)
+      expect(original.calls).toBe(1)
+    } finally {
+      await manager.dispose()
+    }
+    expect(getGlobalDispatcher()).toBe(replacement)
+  })
+  it('restores the latest third-party dispatcher after a second owner takes over', async () => {
+    const first = new OpenAICodexProxyManager()
+    const second = new OpenAICodexProxyManager()
+    first.run('http://127.0.0.1:9', () => undefined)
+    const replacement = new RecordingDispatcher()
+    setGlobalDispatcher(replacement)
+    second.run('http://127.0.0.1:9', () => undefined)
+    await first.dispose()
+    await second.dispose()
+    expect(getGlobalDispatcher()).toBe(replacement)
+  })
   it('scopes fetch through the proxy and leaves unrelated dispatch on the original dispatcher', async () => {
     const target = createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'text/plain' })
