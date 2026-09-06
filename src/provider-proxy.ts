@@ -55,12 +55,8 @@ const proxyScope = new AsyncLocalStorage<ProxyAgent>()
 const activeOwners = new Set<OpenAICodexProxyManager>()
 
 class ScopedProxyDispatcher extends UndiciDispatcher {
-  constructor(private fallback: Dispatcher) {
+  constructor(private readonly fallback: Dispatcher) {
     super()
-  }
-
-  setFallback(fallback: Dispatcher): void {
-    this.fallback = fallback
   }
 
   override dispatch(
@@ -73,18 +69,42 @@ class ScopedProxyDispatcher extends UndiciDispatcher {
 
 let installedDispatcher: ScopedProxyDispatcher | undefined
 let previousDispatcher: Dispatcher | undefined
+const legacySymbol = Symbol.for('undici.globalDispatcher.1')
+interface LegacyDispatcher {
+  dispatch: (...args: unknown[]) => unknown
+}
+let installedLegacy: LegacyDispatcher | undefined
+let previousLegacy: LegacyDispatcher | undefined
+
+function installLegacy(fallback: LegacyDispatcher, bridge: LegacyDispatcher): void {
+  previousLegacy = fallback
+  installedLegacy = {
+    dispatch: (...args: unknown[]) => {
+      const target = proxyScope.getStore() === undefined ? fallback : bridge
+      return target.dispatch(...args)
+    },
+  }
+  Reflect.set(globalThis, legacySymbol, installedLegacy)
+}
 
 function ensureInstalled(owner: OpenAICodexProxyManager): void {
-  if (activeOwners.has(owner)) return
   const current = getGlobalDispatcher()
+  const legacy = Reflect.get(globalThis, legacySymbol) as LegacyDispatcher
   if (installedDispatcher === undefined) {
     previousDispatcher = current
     installedDispatcher = new ScopedProxyDispatcher(current)
     setGlobalDispatcher(installedDispatcher)
+    installLegacy(legacy, Reflect.get(globalThis, legacySymbol) as LegacyDispatcher)
   } else if (current !== installedDispatcher) {
-    // Preserve a dispatcher installed by another library while this wrapper is live.
-    installedDispatcher.setFallback(current)
+    // A third-party wrapper can retain the old dispatcher; never mutate its fallback.
+    installedDispatcher = new ScopedProxyDispatcher(current)
+    previousDispatcher = current
     setGlobalDispatcher(installedDispatcher)
+    installLegacy(legacy === installedLegacy ? previousLegacy! : legacy,
+      Reflect.get(globalThis, legacySymbol) as LegacyDispatcher)
+  } else if (legacy !== installedLegacy) {
+    setGlobalDispatcher(installedDispatcher)
+    installLegacy(legacy, Reflect.get(globalThis, legacySymbol) as LegacyDispatcher)
   }
   activeOwners.add(owner)
 }
@@ -94,9 +114,14 @@ function removeOwner(owner: OpenAICodexProxyManager): void {
   if (activeOwners.size !== 0 || installedDispatcher === undefined) return
   const installed = installedDispatcher
   const previous = previousDispatcher
+  const legacy = Reflect.get(globalThis, legacySymbol) as LegacyDispatcher
+  const restoreLegacy = legacy === installedLegacy ? previousLegacy : legacy
   installedDispatcher = undefined
   previousDispatcher = undefined
   if (getGlobalDispatcher() === installed && previous !== undefined) setGlobalDispatcher(previous)
+  if (restoreLegacy !== undefined) Reflect.set(globalThis, legacySymbol, restoreLegacy)
+  installedLegacy = undefined
+  previousLegacy = undefined
 }
 
 function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
