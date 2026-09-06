@@ -565,4 +565,13 @@ describe('OpenAI Codex Web OAuth boundary', () => {
     })
     expect(mocked.logout).not.toHaveBeenCalled()
   })
+
+  it('does not return opaque refresh response secrets in quota diagnostics', async () => {
+    mocked.status.mockResolvedValue({ authenticated: true })
+    mocked.usage.mockRejectedValue(new Error('Invalid refresh response: {"refresh_token":"opaque-fixture-secret"}'))
+    const auth = new OpenAICodexWebAuth(store)
+    const result = await auth.status()
+    expect(JSON.stringify(result)).not.toContain('opaque-fixture-secret')
+    expect(result).toMatchObject({ quotaError: 'OpenAI Codex operation failed. Please try again.' })
+  })
 })
