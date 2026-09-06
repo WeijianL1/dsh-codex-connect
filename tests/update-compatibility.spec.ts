@@ -24,6 +24,7 @@ const catalog = {
     { version: '0.1.0-alpha.4.25', verifiedDshVersions: ['0.1.2-alpha.5'] },
     { version: '0.1.0-alpha.4.26', verifiedDshVersions: ['0.1.2-rc.1'] },
     { version: '0.1.0-alpha.4.27', verifiedDshVersions: ['0.1.2-rc.1'] },
+    { version: '0.1.0-alpha.4.28', verifiedDshVersions: ['0.1.2-rc.1'] },
   ],
 }
 
