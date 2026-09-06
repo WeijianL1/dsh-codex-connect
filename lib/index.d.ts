@@ -104,12 +104,15 @@ declare function listOpenAICodexProxyCandidates(): readonly string[];
 /** One plugin instance owns its proxy agents and contributes one global wrapper owner. */
 declare class OpenAICodexProxyManager {
   private readonly agents;
+  private readonly connections;
   private activeOperations;
   private idleWaiters;
   private disposed;
   private disposePromise;
+  private closing;
   private waitForIdle;
   private closeAgents;
+  private shutdown;
   private agentFor;
   private acquire;
   /** Run a synchronous or asynchronous Codex operation in the selected proxy scope. */
@@ -120,9 +123,9 @@ declare class OpenAICodexProxyManager {
   }>(proxyUrl: string | undefined, operation: () => T): T;
   /** Probe one proxy without credentials, model calls, quota calls, or settings writes. */
   probe(proxyUrl: string): Promise<OpenAICodexProxyProbeResult>;
-  /** Close owned pools only after all scoped operations have become quiescent. */
+  /** Allow one second to drain, then destroy owned pools with a one-second completion bound. */
   dispose(): Promise<void>;
-  /** Release the process wrapper and pools after the user disables the proxy. */
+  /** Bound shutdown as on disposal; reject new proxy leases until reconfiguration finishes. */
   deactivate(): Promise<void>;
 }
 /** Probe the bounded automatic candidate set in parallel. */
