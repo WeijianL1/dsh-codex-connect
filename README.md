@@ -110,6 +110,7 @@ Direct connection is the default. An enabled credential-free HTTP(S) proxy appli
 ### Search and image tools
 
 - `enableSearch: true` registers Codex as an available search provider and selects it for profile-wide searches. Disabling it unregisters the provider and restores the route that was active before Codex Search was enabled.
+- Search has a 30-second total deadline covering authentication, response headers and body reading. Responses larger than 1 MiB are rejected, and unfinished response bodies are cancelled on failure. Caller cancellation can end a search sooner.
 - `enableImageTool: true` registers `view_image` on vision-capable models. Remote reads accept credential-free public HTTP(S) only and revalidate DNS and redirects.
 - `enableImageGeneration: true` registers prompt-only GPT Image generation. Use the image generation capability included with your current GPT subscription. Availability, dimensions, and quota remain account- and service-controlled.
 
