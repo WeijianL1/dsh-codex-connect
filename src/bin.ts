@@ -18,6 +18,7 @@ import { CODEX_CONNECT_VERSION } from './doctor.ts'
 import { normalizeTrustedOrigin, OpenAICodexTrustedOriginsStore } from './trusted-origins.ts'
 import { runCapabilityCommand } from './capability-cli.ts'
 import { runAutoReviewProbeCommand } from './auto-review-cli.ts'
+import { publicAuthError as safeMessage } from './auth-error.ts'
 
 type Action = 'doctor' | 'login' | 'logout' | 'migrate-history' | 'status' | 'trust-origin' | 'trusted-origins' | 'untrust-origin'
 type DiagnosticReport = Awaited<ReturnType<typeof diagnoseOpenAICodex>>
@@ -44,14 +45,6 @@ function openBrowser(rawUrl: string): void {
   } catch {
     // The printed URL remains the manual fallback.
   }
-}
-
-/** Remove token-like strings from an external OAuth diagnostic. */
-function safeMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error)
-  return message
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu, '[redacted token]')
-    .replace(/(\b(?:code|token|refresh_token|access_token)=)[^&\s]+/giu, '$1[redacted]')
 }
 
 /** Render one provider event without exposing stored credentials. */

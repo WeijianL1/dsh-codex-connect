@@ -28,6 +28,7 @@ import {
 import { FastModeRegistry, isFastModeSessionId } from './fast-mode.ts'
 import { OPENAI_CODEX_FAST_MODE_PATH } from './fast-mode-paths.ts'
 import type { OpenAICodexProxyManager } from './provider-proxy.ts'
+import { publicAuthError as safeMessage } from './auth-error.ts'
 
 export {
   OPENAI_CODEX_AUTH_LOGIN_PATH,
@@ -66,14 +67,6 @@ export interface OpenAICodexWebAuthOptions {
   proxyManager?: OpenAICodexProxyManager | undefined
   /** Resolve the explicitly activated proxy for each operation. */
   resolveProxyUrl?: (() => string | undefined) | undefined
-}
-
-/** Redact provider diagnostics before they cross to the browser. */
-function safeMessage(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error))
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu, '[redacted token]')
-    .replace(/(\b(?:code|token|refresh_token|access_token)=)[^&\s]+/giu, '$1[redacted]')
-    .slice(0, 1000)
 }
 
 /** Reject with the prompt's abort reason while browser callback owns completion. */
