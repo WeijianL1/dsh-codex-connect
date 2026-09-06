@@ -3,9 +3,7 @@
  * @module dsh-codex-connect/search
  */
 
-import { createModels } from '@earendil-works/pi-ai'
-import type { Models } from '@earendil-works/pi-ai'
-import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
+import { readOpenAICodexRequestAuth } from './auth.ts'
 import { WebError } from '@deepseek-ai/dsh-web'
 import type {
   WebSearchProvider,
@@ -227,16 +225,11 @@ function providerMessage(value: unknown): string | undefined {
 /** OpenAI Codex standalone-search provider using the same refreshable OAuth store as the LLM route. */
 export class OpenAICodexSearchProvider implements WebSearchProvider {
   readonly id = OPENAI_CODEX_SEARCH_PROVIDER
-  private readonly models: Models
 
   /**
    * @param options - fixed trusted endpoint policy and deployment tunables.
    */
-  constructor(private readonly options: OpenAICodexSearchProviderOptions) {
-    const models = createModels({ credentials: options.credentials })
-    models.setProvider(openaiCodexProvider())
-    this.models = models
-  }
+  constructor(private readonly options: OpenAICodexSearchProviderOptions) {}
 
   /** The local configuration is usable; credential presence is resolved per request. */
   available(): boolean {
@@ -255,13 +248,13 @@ export class OpenAICodexSearchProvider implements WebSearchProvider {
     throwIfSearchAborted(signal)
     let auth
     try {
-      auth = await abortable(this.models.getAuth(OPENAI_CODEX_PROVIDER), signal)
+      auth = await abortable(readOpenAICodexRequestAuth(this.options.credentials, signal), signal)
     } catch (error: unknown) {
       throwIfSearchAborted(signal)
       if (isAbortError(error)) throw searchAborted(signal, error)
       throw new WebError('OpenAI Codex search credential resolution failed', 'WEB_PROVIDER_ERROR', { cause: error })
     }
-    const access = auth?.auth.apiKey
+    const access = auth?.access
     if (access === undefined || access.length === 0) {
       throw new WebError('OpenAI Codex search is signed out; run "dsh openai-codex login"', 'WEB_PROVIDER_CREDENTIAL_MISSING')
     }

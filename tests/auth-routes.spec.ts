@@ -42,6 +42,7 @@ vi.mock('../src/usage.ts', async importOriginal => ({
 }))
 
 const storeMethods = {
+  captureActiveAccount: vi.fn(),
   accounts: vi.fn(),
   activate: vi.fn(),
   removeAccount: vi.fn(),
@@ -136,6 +137,7 @@ beforeEach(() => {
   mocked.logout.mockResolvedValue(undefined)
   mocked.usage.mockResolvedValue({ rateLimits: [] })
   storeMethods.accounts.mockResolvedValue([])
+  storeMethods.captureActiveAccount.mockImplementation(async () => ({ accounts: async () => storeMethods.accounts() }))
   storeMethods.activate.mockResolvedValue(undefined)
   storeMethods.removeAccount.mockResolvedValue(undefined)
 })

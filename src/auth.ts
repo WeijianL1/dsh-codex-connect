@@ -4,7 +4,7 @@
  */
 
 import { createModels } from '@earendil-works/pi-ai'
-import type { AuthInteraction } from '@earendil-works/pi-ai'
+import type { AuthInteraction, CredentialStore } from '@earendil-works/pi-ai'
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
 import { OpenAICodexCredentialStore, OPENAI_CODEX_PROVIDER } from './store.ts'
 
@@ -46,10 +46,27 @@ export async function logoutOpenAICodex(
  * @returns stored login state and expiry.
  */
 export async function openAICodexAuthStatus(
-  store: OpenAICodexCredentialStore = new OpenAICodexCredentialStore(),
+  store: CredentialStore = new OpenAICodexCredentialStore(),
 ): Promise<OpenAICodexAuthStatus> {
   const credential = await store.read(OPENAI_CODEX_PROVIDER)
   return credential?.type === 'oauth'
     ? { authenticated: true, expiresAt: new Date(credential.expires) }
     : { authenticated: false }
+}
+
+/** Resolve one captured account, including refresh, without rereading the active selection. */
+export async function readOpenAICodexRequestAuth(
+  store: Pick<OpenAICodexCredentialStore, 'captureActiveAccount'>,
+  signal?: AbortSignal,
+): Promise<{ access: string; accountId: string } | undefined> {
+  signal?.throwIfAborted()
+  const credentials = await store.captureActiveAccount()
+  const models = createModels({ credentials })
+  models.setProvider(openaiCodexProvider())
+  const auth = await models.getAuth(OPENAI_CODEX_PROVIDER, signal === undefined ? undefined : { signal })
+  const access = auth?.auth.apiKey
+  const credential = await credentials.read(OPENAI_CODEX_PROVIDER)
+  if (credential?.type !== 'oauth' || credential.access !== access || !access
+    || typeof credential.accountId !== 'string' || credential.accountId.length === 0) return undefined
+  return { access, accountId: credential.accountId }
 }

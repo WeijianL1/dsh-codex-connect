@@ -6,7 +6,7 @@ import type { AuthEvent, AuthPrompt } from '@earendil-works/pi-ai'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { loginOpenAICodex, logoutOpenAICodex, openAICodexAuthStatus } from './auth.ts'
-import type { OpenAICodexCredentialStore } from './store.ts'
+import type { CapturedOpenAICodexAccount, OpenAICodexCredentialStore } from './store.ts'
 import {
   isOpenAICodexReauthRequiredError,
   OPENAI_CODEX_REAUTH_REQUIRED_MESSAGE,
@@ -112,10 +112,10 @@ export class OpenAICodexWebAuth {
   }
 
   /** Read current public state, consulting durable storage while idle. */
-  async status(): Promise<OpenAICodexWebAuthStatus> {
-    if (this.operation !== undefined) return this.state
+  async status(snapshot?: CapturedOpenAICodexAccount): Promise<OpenAICodexWebAuthStatus> {
+    if (this.operation !== undefined && this.state.status === 'signing-in') return this.state
     if (this.state.status === 'error') return this.state
-    return this.readStoredStatus()
+    return this.readStoredStatus(snapshot)
   }
 
   /** Start or join the current browser-login operation. */
@@ -263,11 +263,12 @@ export class OpenAICodexWebAuth {
     for (const waiter of this.challengeWaiters.splice(0)) waiter.resolve(challenge)
   }
 
-  private async readStoredStatus(): Promise<OpenAICodexWebAuthStatus> {
-    const stored = await openAICodexAuthStatus(this.store)
+  private async readStoredStatus(snapshot?: CapturedOpenAICodexAccount): Promise<OpenAICodexWebAuthStatus> {
+    const credentials = snapshot ?? await this.store.captureActiveAccount()
+    const stored = await openAICodexAuthStatus(credentials)
     if (!stored.authenticated) return { status: 'signed-out' }
     try {
-      const readUsage = () => readOpenAICodexRateLimits(this.store)
+      const readUsage = () => readOpenAICodexRateLimits(credentials)
       return {
         status: 'signed-in',
         usage: await (this.proxyManager?.run(this.resolveProxyUrl(), readUsage) ?? readUsage()),
@@ -550,7 +551,8 @@ export function registerOpenAICodexAuthRoutes(
         handler: async (req, res) => {
           if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
           if (!await authorize(req, res)) return
-          const [status, accounts] = await Promise.all([auth.status(), store.accounts()])
+          const snapshot = await store.captureActiveAccount()
+          const [status, accounts] = await Promise.all([auth.status(snapshot), snapshot.accounts()])
           json(res, 200, { ...status, accounts })
         },
       }),

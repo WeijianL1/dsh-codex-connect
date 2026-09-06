@@ -25,6 +25,39 @@ const json = (value: unknown) => {
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('shared Models and Plugin account state', () => {
+  it('drops retained quota when another account becomes active during pending login', async () => {
+    let pending = false
+    vi.stubGlobal('fetch', async () => rawJson(pending
+      ? { status: 'signing-in', accounts: [{ ...SECOND_ACCOUNT, active: true }] }
+      : { status: 'signed-in', usage: { rateLimits: [] }, quotaError: 'quota-a', accounts: [ACTIVE_ACCOUNT] }))
+    const account = new OpenAICodexAccountStore()
+    const unsubscribe = account.subscribe(() => {})
+    try {
+      await waitFor(() => { expect(account.getSnapshot().status.status).toBe('signed-in') })
+      pending = true
+      await account.refresh()
+      expect(account.getSnapshot().status).toEqual({ status: 'signing-in' })
+      expect(account.getSnapshot().accounts[0]?.accountKey).toBe(SECOND_ACCOUNT_KEY)
+    } finally { unsubscribe(); account.dispose() }
+  })
+
+  it('reads quota and labels together after a concurrent account mutation', async () => {
+    const accounts = [{ ...SECOND_ACCOUNT, active: true }]
+    vi.stubGlobal('fetch', async (path: string, init?: RequestInit) => {
+      if (path === OPENAI_CODEX_AUTH_ACCOUNTS_PATH && init?.method === 'POST') {
+        return rawJson({ status: 'signed-in', usage: { rateLimits: [] }, quotaError: 'quota-a' })
+      }
+      if (path === OPENAI_CODEX_AUTH_ACCOUNTS_PATH) return rawJson({ accounts })
+      return rawJson({ status: 'signed-in', usage: { rateLimits: [] }, quotaError: 'quota-b', accounts })
+    })
+    const account = new OpenAICodexAccountStore()
+    try {
+      await account.activate(SECOND_ACCOUNT_KEY)
+      expect(account.getSnapshot().status).toMatchObject({ quotaError: 'quota-b' })
+      expect(account.getSnapshot().accounts).toEqual(accounts)
+    } finally { account.dispose() }
+  })
+
   it.each([
     [{ status: 'signing-in' }, en.continueAuthorization],
     [{ status: 'reauth-required', message: 'Authorization expired' }, en.reauthorize],
@@ -325,7 +358,7 @@ describe('shared Models and Plugin account state', () => {
     account.dispose()
   })
 
-  it('reconciles a successful mutation after its account-list refresh fails', async () => {
+  it('reconciles a successful mutation after its status snapshot refresh fails', async () => {
     vi.useFakeTimers()
     let statusReads = 0
     const switched = [
@@ -335,6 +368,7 @@ describe('shared Models and Plugin account state', () => {
     const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === OPENAI_CODEX_AUTH_STATUS_PATH) {
         statusReads += 1
+        if (statusReads === 2) return new Response(JSON.stringify({ error: 'temporary failure' }), { status: 503 })
         return rawJson({
           status: 'signed-in',
           usage: { rateLimits: [] },
@@ -358,9 +392,9 @@ describe('shared Models and Plugin account state', () => {
     await account.activate(SECOND_ACCOUNT_KEY)
     expect(account.getSnapshot().operationError).toBe('temporary failure')
     await vi.advanceTimersByTimeAsync(4_999)
-    expect(statusReads).toBe(1)
-    await vi.advanceTimersByTimeAsync(1)
     expect(statusReads).toBe(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(statusReads).toBe(3)
     expect(account.getSnapshot().accounts).toEqual(switched)
     expect(account.getSnapshot().operationError).toBeUndefined()
     unsubscribe()
