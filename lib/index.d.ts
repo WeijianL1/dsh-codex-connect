@@ -64,7 +64,7 @@ declare class OpenAICodexCredentialStore implements CredentialStore {
   /** Remove one account; active removal requires an explicit stored replacement. */
   removeAccount(selectedAccountKey: string, replacementAccountKey?: string): Promise<void>;
   /** @inheritdoc */
-  modify(providerId: string, fn: (current: Credential | undefined) => Promise<Credential | undefined>): Promise<Credential | undefined>;
+  modify(providerId: string, fn: (current: Credential | undefined) => Promise<Credential | undefined>, options?: Parameters<CredentialStore['modify']>[2]): Promise<Credential | undefined>;
   /** @inheritdoc */
   delete(providerId: string): Promise<void>;
 }

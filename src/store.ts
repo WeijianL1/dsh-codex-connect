@@ -263,12 +263,13 @@ export class OpenAICodexCredentialStore implements CredentialStore {
       list: async () => requestCredential === undefined
         ? []
         : [{ providerId: OPENAI_CODEX_PROVIDER, type: 'oauth' }],
-      modify: async (providerId, fn) => {
+      modify: async (providerId, fn, options) => {
+        options?.signal?.throwIfAborted()
         if (providerId !== OPENAI_CODEX_PROVIDER) {
           throw new Error(`openai-codex: captured credential store does not own provider "${providerId}"`)
         }
         if (capturedAccountId === undefined) return undefined
-        requestCredential = await this.modifyCapturedAccount(capturedAccountId, fn)
+        requestCredential = await this.modifyCapturedAccount(capturedAccountId, fn, options)
         return requestCredential === undefined ? undefined : cloneCredential(requestCredential)
       },
       delete: async providerId => {
@@ -282,6 +283,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
   private async modifyCapturedAccount(
     capturedAccountId: string,
     fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+    options?: Parameters<CredentialStore['modify']>[2],
   ): Promise<StoredOAuthCredential | undefined> {
     await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
     return withFileLock(this.filename, async () => {
@@ -291,6 +293,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
       const capturedIndex = credentials.findIndex(credential => credential.accountId === capturedAccountId)
       if (capturedIndex < 0) return undefined
       const current = cloneCredential(credentials[capturedIndex]!)
+      options?.signal?.throwIfAborted()
       const candidate = await fn(current)
       if (candidate === undefined) return current
       const validated = parseCredential(candidate, this.filename)
@@ -395,7 +398,9 @@ export class OpenAICodexCredentialStore implements CredentialStore {
   async modify(
     providerId: string,
     fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+    options?: Parameters<CredentialStore['modify']>[2],
   ): Promise<Credential | undefined> {
+    options?.signal?.throwIfAborted()
     if (providerId !== OPENAI_CODEX_PROVIDER) {
       throw new Error(`openai-codex: credential store does not own provider "${providerId}"`)
     }
@@ -403,6 +408,8 @@ export class OpenAICodexCredentialStore implements CredentialStore {
     return withFileLock(this.filename, async () => {
       const currentDocument = await this.readDocument()
       const current = currentDocument === undefined ? undefined : cloneCredential(activeCredential(currentDocument))
+      // pi-ai treats invocation of fn as the commit point and waits for its result.
+      options?.signal?.throwIfAborted()
       const candidate = await fn(current)
       if (candidate === undefined) return current
       const validated = parseCredential(candidate, this.filename)
