@@ -6,6 +6,7 @@
 import { createModels } from '@earendil-works/pi-ai'
 import type { AuthInteraction, CredentialStore } from '@earendil-works/pi-ai'
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
+import { openaiCodexOAuth } from '../vendor/pi-ai-oauth/auth/oauth/openai-codex.js'
 import { OpenAICodexCredentialStore, OPENAI_CODEX_PROVIDER } from './store.ts'
 
 /** Non-secret login state shown by the launcher. */
@@ -26,8 +27,18 @@ export async function loginOpenAICodex(
   store: OpenAICodexCredentialStore = new OpenAICodexCredentialStore(),
 ): Promise<void> {
   const models = createModels({ credentials: store })
-  models.setProvider(openaiCodexProvider())
-  await models.login(OPENAI_CODEX_PROVIDER, 'oauth', interaction)
+  const provider = openaiCodexProvider()
+  let login: ReturnType<typeof openaiCodexOAuth.login> | undefined
+  models.setProvider({ ...provider, auth: { ...provider.auth, oauth: {
+    ...openaiCodexOAuth,
+    login: callbacks => { login = openaiCodexOAuth.login(callbacks); return login },
+  } } })
+  try {
+    await models.login(OPENAI_CODEX_PROVIDER, 'oauth', interaction)
+  } finally {
+    // Models may settle cancellation before the provider has closed its callback server.
+    await login?.catch(() => undefined)
+  }
 }
 
 /**
