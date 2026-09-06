@@ -24,6 +24,11 @@ interface OpenAICodexAccountSummary {
   profileSource: OpenAICodexAccountProfileSource;
   active: boolean;
 }
+/** One request's credentials and browser labels from the same document read. */
+interface CapturedOpenAICodexAccount extends CredentialStore {
+  accounts(): Promise<readonly OpenAICodexAccountSummary[]>;
+  captureActiveAccount(): Promise<CapturedOpenAICodexAccount>;
+}
 /**
  * Resolve the default OAuth document path.
  * @param dshHome - optional Harness-home override.
@@ -51,7 +56,7 @@ declare class OpenAICodexCredentialStore implements CredentialStore {
    * Refreshes through the returned store update only that captured account and
    * never change the user's current account selection.
    */
-  captureActiveAccount(): Promise<CredentialStore>;
+  captureActiveAccount(): Promise<CapturedOpenAICodexAccount>;
   private modifyCapturedAccount;
   /** @inheritdoc */
   list(): Promise<readonly CredentialInfo[]>;
@@ -200,7 +205,6 @@ declare class OpenAICodexTransport extends Service implements OpenAICodexTranspo
   private readonly proxyManager?;
   private readonly resolveProxyUrl;
   readonly apiVersion: 1;
-  private readonly models;
   constructor(ctx: Context, credentials: OpenAICodexCredentialStore, proxyManager?: OpenAICodexProxyManager | undefined, resolveProxyUrl?: () => string | undefined);
   generateImages(input: ImageGenerationRequest, context: ImageRequestContext): Promise<ImageGenerationResponse>;
   private generateImagesWithoutProxy;
@@ -383,7 +387,7 @@ declare function parseOpenAICodexUsage(value: unknown): OpenAICodexUsage;
  * @param store - plugin-owned OAuth credential store.
  * @returns current rate-limit buckets safe to expose to the local browser page.
  */
-declare function readOpenAICodexRateLimits(store: OpenAICodexCredentialStore): Promise<OpenAICodexUsage>;
+declare function readOpenAICodexRateLimits(store: Pick<OpenAICodexCredentialStore, 'captureActiveAccount'>): Promise<OpenAICodexUsage>;
 //#endregion
 //#region src/settings-contract.d.ts
 /** Node-free settings contract shared by the Host plugin and browser card. */
@@ -521,7 +525,6 @@ declare function mapOpenAICodexSearchResponse(value: unknown): WebSearchResult;
 declare class OpenAICodexSearchProvider implements WebSearchProvider {
   private readonly options;
   readonly id = "openai-codex";
-  private readonly models;
   /**
    * @param options - fixed trusted endpoint policy and deployment tunables.
    */
@@ -564,7 +567,7 @@ declare function logoutOpenAICodex(store?: OpenAICodexCredentialStore): Promise<
  * @param store - credential store, defaulting under `$DSH_HOME`.
  * @returns stored login state and expiry.
  */
-declare function openAICodexAuthStatus(store?: OpenAICodexCredentialStore): Promise<OpenAICodexAuthStatus>;
+declare function openAICodexAuthStatus(store?: CredentialStore): Promise<OpenAICodexAuthStatus>;
 //#endregion
 //#region src/fast-mode.d.ts
 /** Process-local, per-session OpenAI Codex Fast Mode state. */

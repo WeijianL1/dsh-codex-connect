@@ -55,6 +55,26 @@ export interface OpenAICodexAccountSummary {
   active: boolean
 }
 
+/** One request's credentials and browser labels from the same document read. */
+export interface CapturedOpenAICodexAccount extends CredentialStore {
+  accounts(): Promise<readonly OpenAICodexAccountSummary[]>
+  captureActiveAccount(): Promise<CapturedOpenAICodexAccount>
+}
+
+function accountSummaries(document: AuthDocument | undefined): readonly OpenAICodexAccountSummary[] {
+  if (document === undefined) return []
+  const credentials = documentCredentials(document)
+  const profiles = resolveOpenAICodexAccountProfiles(credentials)
+  const activeAccountId = activeCredential(document).accountId
+  return credentials.map((credential, index) => ({
+    accountKey: accountKey(credential.accountId),
+    displayName: profiles[index]!.displayName,
+    ...(profiles[index]!.maskedEmail === undefined ? {} : { maskedEmail: profiles[index]!.maskedEmail }),
+    profileSource: profiles[index]!.source,
+    active: credential.accountId === activeAccountId,
+  }))
+}
+
 /** Whether a filesystem error reports an absent path. */
 function isENOENT(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT'
@@ -251,12 +271,14 @@ export class OpenAICodexCredentialStore implements CredentialStore {
    * Refreshes through the returned store update only that captured account and
    * never change the user's current account selection.
    */
-  async captureActiveAccount(): Promise<CredentialStore> {
+  async captureActiveAccount(): Promise<CapturedOpenAICodexAccount> {
     const document = await this.readDocument()
     const captured = document === undefined ? undefined : cloneCredential(activeCredential(document))
     const capturedAccountId = captured?.accountId
     let requestCredential: StoredOAuthCredential | undefined = captured
-    return {
+    const snapshot: CapturedOpenAICodexAccount = {
+      accounts: async () => accountSummaries(document),
+      captureActiveAccount: async () => snapshot,
       read: async providerId => providerId === OPENAI_CODEX_PROVIDER && requestCredential !== undefined
         ? cloneCredential(requestCredential)
         : undefined,
@@ -278,6 +300,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
         }
       },
     }
+    return snapshot
   }
 
   private async modifyCapturedAccount(
@@ -319,18 +342,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
 
   /** List browser-safe account summaries without exposing provider account ids. */
   async accounts(): Promise<readonly OpenAICodexAccountSummary[]> {
-    const document = await this.readDocument()
-    if (document === undefined) return []
-    const credentials = documentCredentials(document)
-    const profiles = resolveOpenAICodexAccountProfiles(credentials)
-    const activeAccountId = activeCredential(document).accountId
-    return credentials.map((credential, index) => ({
-      accountKey: accountKey(credential.accountId),
-      displayName: profiles[index]!.displayName,
-      ...(profiles[index]!.maskedEmail === undefined ? {} : { maskedEmail: profiles[index]!.maskedEmail }),
-      profileSource: profiles[index]!.source,
-      active: credential.accountId === activeAccountId,
-    }))
+    return accountSummaries(await this.readDocument())
   }
 
   /** Resolve the account id stored with one exact access token. */

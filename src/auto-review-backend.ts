@@ -1,10 +1,7 @@
 /** OAuth transport for the hidden first-party Codex Auto-review route. */
 
-import { createModels } from '@earendil-works/pi-ai'
-import type { MutableModels } from '@earendil-works/pi-ai'
-import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
+import { readOpenAICodexRequestAuth } from './auth.ts'
 import type { OpenAICodexCredentialStore } from './store.ts'
-import { OPENAI_CODEX_PROVIDER } from './store.ts'
 import type { OpenAICodexProxyManager } from './provider-proxy.ts'
 import { OPENAI_CODEX_BASE_URL } from './search.ts'
 import { CODEX_AUTO_REVIEW_MODEL } from './auto-review-probe.ts'
@@ -126,17 +123,12 @@ function aborted(signal?: AbortSignal): boolean {
 
 /** OAuth-backed implementation of the first-party Codex reviewer. */
 export class OpenAICodexAutoReviewBackend implements AutoReviewBackend {
-  private readonly models: MutableModels
-
   constructor(
     credentials: OpenAICodexCredentialStore,
     private readonly proxyManager: OpenAICodexProxyManager,
     private readonly resolveProxyUrl: () => string | undefined,
     private readonly credentialStore: OpenAICodexCredentialStore = credentials,
-  ) {
-    this.models = createModels({ credentials })
-    this.models.setProvider(openaiCodexProvider())
-  }
+  ) {}
 
   /** @inheritdoc */
   async review(input: AutoReviewBackendInput): Promise<AutoReviewBackendResult> {
@@ -147,63 +139,65 @@ export class OpenAICodexAutoReviewBackend implements AutoReviewBackend {
     input.signal?.addEventListener('abort', cancel, { once: true })
     const timer = setTimeout(() => { timedOut = true; controller.abort() }, AUTO_REVIEW_TIMEOUT_MS)
     try {
-      const auth = await this.models.getAuth(OPENAI_CODEX_PROVIDER, { signal: controller.signal })
-      const access = auth?.auth.apiKey
-      const accountId = access === undefined ? undefined : await this.credentialStore.accountIdForAccess(access)
-      if (access === undefined || access.length === 0 || accountId === undefined || accountId.length === 0) return { status: 'unavailable' }
-      const response = await this.proxyManager.run(this.resolveProxyUrl(), () => fetch(`${OPENAI_CODEX_BASE_URL}/responses`, {
-        method: 'POST',
-        redirect: 'manual',
-        signal: controller.signal,
-        headers: {
-          authorization: `Bearer ${access}`,
-          'chatgpt-account-id': accountId,
-          'content-type': 'application/json',
-          accept: 'text/event-stream',
-          originator: 'deepseek-harness',
-        },
-        body: JSON.stringify({
-          model: CODEX_AUTO_REVIEW_MODEL,
-          instructions: reviewerInstructions,
-          input: [{
-            role: 'user',
-            content: [{ type: 'input_text', text: JSON.stringify({
-              planned_action: input.action,
-              transcript: input.context.transcript,
-              tools: input.context.tools,
-              truncation: {
-                transcript_entries_omitted: input.context.transcriptEntriesOmitted,
-                tool_entries_omitted: input.context.toolEntriesOmitted,
-                entries_truncated: input.context.entriesTruncated,
-              },
-            }) }],
-          }],
-          text: { format: { type: 'json_schema', name: 'codex_auto_review_assessment', strict: true, schema: assessmentSchema } },
-          stream: true,
-          store: false,
-        }),
-      }))
-      if (!response.ok || response.body === null || !response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')) {
-        await response.body?.cancel()
-        return { status: 'unavailable' }
-      }
-      const reader = response.body.getReader()
-      const chunks: Uint8Array[] = []
-      let size = 0
-      try {
-        while (true) {
-          const { value, done } = await reader.read()
-          if (done) break
-          size += value.byteLength
-          if (size > AUTO_REVIEW_MAX_RESPONSE_BYTES) {
-            await reader.cancel()
-            return { status: 'unavailable' }
-          }
-          chunks.push(value)
+      return await this.proxyManager.run<Promise<AutoReviewBackendResult>>(this.resolveProxyUrl(), async () => {
+        const auth = await readOpenAICodexRequestAuth(this.credentialStore, controller.signal)
+        const access = auth?.access
+        const accountId = auth?.accountId
+        if (access === undefined || access.length === 0 || accountId === undefined || accountId.length === 0) return { status: 'unavailable' }
+        const response = await fetch(`${OPENAI_CODEX_BASE_URL}/responses`, {
+          method: 'POST',
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: {
+            authorization: `Bearer ${access}`,
+            'chatgpt-account-id': accountId,
+            'content-type': 'application/json',
+            accept: 'text/event-stream',
+            originator: 'deepseek-harness',
+          },
+          body: JSON.stringify({
+            model: CODEX_AUTO_REVIEW_MODEL,
+            instructions: reviewerInstructions,
+            input: [{
+              role: 'user',
+              content: [{ type: 'input_text', text: JSON.stringify({
+                planned_action: input.action,
+                transcript: input.context.transcript,
+                tools: input.context.tools,
+                truncation: {
+                  transcript_entries_omitted: input.context.transcriptEntriesOmitted,
+                  tool_entries_omitted: input.context.toolEntriesOmitted,
+                  entries_truncated: input.context.entriesTruncated,
+                },
+              }) }],
+            }],
+            text: { format: { type: 'json_schema', name: 'codex_auto_review_assessment', strict: true, schema: assessmentSchema } },
+            stream: true,
+            store: false,
+          }),
+        })
+        if (!response.ok || response.body === null || !response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')) {
+          await response.body?.cancel()
+          return { status: 'unavailable' }
         }
-      } finally { reader.releaseLock() }
-      const assessment = parseAutoReviewStream(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)))
-      return assessment === undefined ? { status: 'unavailable' } : { status: 'completed', assessment }
+        const reader = response.body.getReader()
+        const chunks: Uint8Array[] = []
+        let size = 0
+        try {
+          while (true) {
+            const { value, done } = await reader.read()
+            if (done) break
+            size += value.byteLength
+            if (size > AUTO_REVIEW_MAX_RESPONSE_BYTES) {
+              await reader.cancel()
+              return { status: 'unavailable' }
+            }
+            chunks.push(value)
+          }
+        } finally { reader.releaseLock() }
+        const assessment = parseAutoReviewStream(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)))
+        return assessment === undefined ? { status: 'unavailable' } : { status: 'completed', assessment }
+      })
     } catch {
       if (aborted(input.signal)) return { status: 'cancelled' }
       return { status: timedOut ? 'timeout' : 'unavailable' }

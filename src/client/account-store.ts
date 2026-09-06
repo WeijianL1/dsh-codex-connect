@@ -253,6 +253,8 @@ export class OpenAICodexAccountStore {
 
   private stableStatus(status: AccountStatus, accounts: readonly AccountSummary[]): AccountStatus {
     if (status.status !== 'signing-in' || accounts.length === 0) return status
+    if (accounts.find(account => account.active)?.accountKey
+      !== this.snapshot.accounts.find(account => account.active)?.accountKey) return status
     return this.snapshot.status.status === 'signed-in' || this.snapshot.status.status === 'reauth-required'
       ? this.snapshot.status
       : status
@@ -374,8 +376,8 @@ export class OpenAICodexAccountStore {
     this.stopPolling()
     this.publish({ ...this.snapshot, busy: true, operation: { kind, accountKey } })
     try {
-      const status = parseStatus(await request(OPENAI_CODEX_AUTH_ACCOUNTS_PATH, method, undefined, body))
-      const accounts = parseAccounts(await request(OPENAI_CODEX_AUTH_ACCOUNTS_PATH))
+      await request(OPENAI_CODEX_AUTH_ACCOUNTS_PATH, method, undefined, body)
+      const { status, accounts } = await this.readServerState()
       this.publish({ status, accounts, busy: false, operation: { kind: 'idle' } })
     } catch (error: unknown) {
       this.publish({
