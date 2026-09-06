@@ -13,19 +13,20 @@ on:
         type: string
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+  actions: read
 
 concurrency:
   group: npm-release
   cancel-in-progress: false
 
 jobs:
-  publish:
+  verify:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: npm-release
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - name: Check out the selected main commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,6 +54,11 @@ jobs:
           test "$(npm --version)" = "11.6.4"
           test "$(node --version)" = "v24.15.0"
           test "$(pnpm --version)" = "10.30.3"
+
+      - name: Require successful CI for the exact main SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-release-ci.mjs
 
       - name: Install dependencies from the lockfile
         run: pnpm --config.minimum-release-age=0 install --frozen-lockfile
@@ -125,13 +131,71 @@ jobs:
       - name: Run complete check before publishing
         run: pnpm run check
 
+      - name: Pack the verified files without lifecycle scripts
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all -- lib)"
+          mkdir -p "$RUNNER_TEMP/release"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release"
+          mv "$RUNNER_TEMP/release/"*.tgz "$RUNNER_TEMP/release/release.tgz"
+          echo "sha256=$(sha256sum "$RUNNER_TEMP/release/release.tgz" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the verified package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-package-${{ github.sha }}
+          path: ${{ runner.temp }}/release/release.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: npm-release
+    permissions:
+      contents: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Check out release gate code only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.15.0
+      - name: Pin npm for Trusted Publishing
+        run: npm install --global npm@11.6.4 --no-fund --no-audit --ignore-scripts
+      - name: Recheck exact SHA CI after environment approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-release-ci.mjs
+      - name: Download the verified package from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-package-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+      - name: Verify package digest
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ needs.verify.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          echo "$EXPECTED_SHA256  $RUNNER_TEMP/release/release.tgz" | sha256sum --check --strict
+
       - name: Publish alpha through npm Trusted Publishing
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          npm publish --tag alpha --provenance
+          npm publish "$RUNNER_TEMP/release/release.tgz" --tag alpha --provenance --ignore-scripts
 
       - name: Verify npm version and alpha dist-tag
         shell: bash
