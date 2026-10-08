@@ -3,14 +3,14 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { page, userEvent } from 'vitest/browser'
 import { modelCatalogFixture } from '../model-catalog-fixture.ts'
-import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
+import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { DEFAULT_OPENAI_CODEX_SETTINGS, resolveOpenAICodexSettings, type OpenAICodexSettingsConfig } from '../../src/settings-contract.ts'
 import { OPENAI_CODEX_MODEL_CATALOG_PATH } from '../../src/model-contract.ts'
 import { OpenAICodexConfiguration } from '../../src/client/OpenAICodexConfiguration.tsx'
 import { OpenAICodexAccountStore } from '../../src/client/account-store.ts'
 import { OpenAICodexModelsCard } from '../../src/client/OpenAICodexModelsCard.tsx'
 import { OpenAICodexSettings } from '../../src/client/OpenAICodexSettings.tsx'
-import { en } from '../../src/client/locales.ts'
+import { en, zh } from '../../src/client/locales.ts'
 import { OPENAI_CODEX_AUTH_ACCOUNTS_PATH, OPENAI_CODEX_AUTH_CANCEL_PATH, OPENAI_CODEX_AUTH_LOGIN_PATH, OPENAI_CODEX_AUTH_LOGOUT_PATH, OPENAI_CODEX_AUTH_STATUS_PATH } from '../../src/auth-paths.ts'
 
 let root: Root | undefined
@@ -20,22 +20,50 @@ afterEach(() => { root?.unmount(); host?.remove(); account?.dispose(); vi.unstub
 const t = (key: keyof typeof en) => en[key]
 
 describe('Models account navigation', () => {
+  it.each([['English', en], ['Chinese', zh]] as const)('reconciles the active label and quota after cancellation in %s', async (_locale, messages) => {
+    const first = { accountKey: `acct_${'a'.repeat(43)}`, active: true, displayName: 'Work account', profileSource: 'oauth' }
+    const second = { accountKey: `acct_${'b'.repeat(43)}`, active: true, displayName: 'Personal account', profileSource: 'oauth' }
+    let current = first
+    const usage = () => ({ rateLimits: [{ id: 'codex', name: 'Codex', windows: [{ windowSeconds: 18_000, remainingPercent: current === first ? 83 : 27 }] }] })
+    const popup = vi.spyOn(window, 'open').mockReturnValue(null)
+    vi.stubGlobal('fetch', async (path: string) => {
+      if (path === OPENAI_CODEX_AUTH_LOGIN_PATH) return Response.json({ url: 'https://auth.openai.com/authorize' })
+      if (path === OPENAI_CODEX_AUTH_CANCEL_PATH) return Response.json({ status: 'signed-in', usage: usage() })
+      return Response.json({ status: 'signed-in', usage: usage(), accounts: [current] })
+    })
+    account = new OpenAICodexAccountStore()
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+    root.render(<OpenAICodexModelsCard t={key => messages[key]} account={account} />)
+    try {
+      await expect.element(page.getByText('Work account', { exact: true })).toBeVisible()
+      await page.getByRole('button', { name: messages.viewQuota, exact: true }).click()
+      await expect.element(page.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '83')
+      await account.signIn()
+      current = second
+      await page.getByRole('button', { name: messages.cancelSignIn, exact: true }).click()
+      await expect.element(page.getByText('Personal account', { exact: true })).toBeVisible()
+      await expect.element(page.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '27')
+    } finally { popup.mockRestore() }
+  })
   it('shares saved configuration with the plugin entry, discards modal drafts and contains keyboard focus', async () => {
-    let snapshot: SettingsScopeSnapshot<OpenAICodexSettingsConfig> = {
+    let snapshot: ConfigFormSnapshot<OpenAICodexSettingsConfig> = {
       status: 'ready', value: { ...DEFAULT_OPENAI_CODEX_SETTINGS }, base: { ...DEFAULT_OPENAI_CODEX_SETTINGS },
       user: undefined, revision: 0, writable: true, mode: 'host',
     }
     const listeners = new Set<() => void>()
-    const mutate = vi.fn<SettingsScope<OpenAICodexSettingsConfig>['mutate']>(async (ops, revision) => {
+    const mutate = vi.fn<ConfigForm<OpenAICodexSettingsConfig>['mutate']>(async (ops, revision) => {
       if (revision !== snapshot.revision) throw new Error('stale revision')
       const next = { ...snapshot.value! }
       for (const op of ops) Object.assign(next, { [op.path[0]!]: op.op === 'set' ? op.value : undefined })
       snapshot = { ...snapshot, value: resolveOpenAICodexSettings(next), revision: (snapshot.revision ?? 0) + 1 }
       for (const listener of listeners) listener()
+      return true
     })
-    const scope: SettingsScope<OpenAICodexSettingsConfig> = {
+    const scope: ConfigForm<OpenAICodexSettingsConfig> = {
       getSnapshot: () => snapshot, subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener) } },
-      set: vi.fn(async () => { throw new Error('Use an atomic mutation') }), unset: vi.fn(), mutate,
+      set: vi.fn(async () => { throw new Error('Use an atomic mutation') }), unset: vi.fn(async () => true), mutate,
     }
     vi.stubGlobal('fetch', async (path: string) => Response.json(path === OPENAI_CODEX_MODEL_CATALOG_PATH
       ? modelCatalogFixture([{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }, { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' }])

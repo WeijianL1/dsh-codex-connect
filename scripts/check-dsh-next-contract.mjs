@@ -23,8 +23,11 @@ import {
   InfrastructureCheckError,
   commandFailureClassification,
   installCheckExitCode,
+  validateDoctorResult,
 } from './check-dsh-install.mjs'
 import { validateRuntimeProjection } from './check-installed-runtime.mjs'
+import './canary-multiversion.test.mjs'
+import './canary-maintenance.test.mjs'
 
 const failures = []
 let assertionCount = 0
@@ -126,7 +129,7 @@ assertContract(
     alpha: '0.1.4-alpha.1',
   }) === undefined,
 )
-assertContract('an exact declared version is unchanged', classifyCandidateVersion('0.1.2-alpha.5', '0.1.2-alpha.5') === 'unchanged')
+assertContract('an exact supported version is declared', classifyCandidateVersion('0.1.2-alpha.5', '0.1.2-alpha.5') === 'declared')
 assertContract('an older stable candidate is not newer than a declared alpha', classifyCandidateVersion('0.1.1-rc.2', '0.1.2-alpha.5') === 'not-newer')
 assertContract(
   'later prereleases and stable releases supersede a declared alpha',
@@ -216,6 +219,117 @@ assertContract(
   }, 'compatibility') === 'infrastructure',
 )
 
+const candidateDoctor = {
+  schemaVersion: 1,
+  credentialFile: { state: 'missing' },
+  compatibility: {
+    schemaVersion: 1,
+    status: 'unverified',
+    node: { status: 'compatible' },
+    packages: Object.fromEntries(['@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-llm-pi-ai', '@deepseek-ai/dsh-compaction', '@earendil-works/pi-ai'].map(name => [name, {
+      supported: name === '@earendil-works/pi-ai' ? '0.85.1' : '0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1',
+      installed: name === '@earendil-works/pi-ai' ? '0.85.1' : '0.1.7-rc.3',
+      status: 'unverified',
+    }])),
+  },
+}
+const candidateDoctorOptions = { allowUndeclaredCanaryVersion: true, dshVersion: '0.1.7-rc.3' }
+function doctorOutcome(report, options = candidateDoctorOptions, status = 1, stderr = '') {
+  try {
+    validateDoctorResult({ status, stdout: JSON.stringify(report), stderr }, '/fixture-home', '/fixture-repo', options)
+    return 'continue-runtime'
+  } catch (error) {
+    return installCheckExitCode(error)
+  }
+}
+assertContract('issue 169: a valid unverified candidate doctor continues to runtime validation', doctorOutcome(candidateDoctor) === 'continue-runtime')
+assertContract('declared installation checks still reject unverified versions', doctorOutcome(candidateDoctor, { dshVersion: '0.1.2-rc.1' }) === 1)
+const declaredDoctor = structuredClone(candidateDoctor)
+declaredDoctor.compatibility.status = 'compatible'
+for (const [name, entry] of Object.entries(declaredDoctor.compatibility.packages)) {
+  entry.installed = name === '@earendil-works/pi-ai' ? '0.85.1' : '0.1.7-rc.1'
+  entry.status = 'compatible'
+}
+assertContract('declared compatible diagnostics still pass', doctorOutcome(declaredDoctor, {}, 0) === 'continue-runtime')
+assertContract('compatible JSON cannot explain a nonzero doctor exit', doctorOutcome(declaredDoctor, { allowUndeclaredCanaryVersion: true, dshVersion: '0.1.7-rc.1' }) === 1)
+assertContract('zero exit does not exempt an unverified report from declared validation', doctorOutcome(candidateDoctor, {}, 0) === 1)
+assertContract('malformed candidate JSON remains a compatibility failure', doctorOutcome(null) === 1)
+for (const [name, mutate] of [
+  ['Node engine mismatch', report => { report.compatibility.node.status = 'incompatible' }],
+  ['missing dependency', report => { delete report.compatibility.packages['@deepseek-ai/dsh-llm'].installed }],
+  ['unknown dependency', report => { report.compatibility.packages['@deepseek-ai/dsh-llm'].status = 'unknown' }],
+  ['incompatible dependency', report => { report.compatibility.packages['@deepseek-ai/dsh-llm'].status = 'incompatible' }],
+  ['wrong installed candidate', report => { report.compatibility.packages['@deepseek-ai/dsh-llm'].installed = '0.1.3-alpha.2' }],
+  ['credential failure', report => { report.credentialFile.state = 'permissions-too-broad' }],
+  ['private credential path', report => { report.credentialFile.path = '/fixture-home/credentials' }],
+]) {
+  const report = structuredClone(candidateDoctor)
+  mutate(report)
+  assertContract(`candidate doctor rejects ${name}`, doctorOutcome(report) === 1)
+}
+assertContract('unverified JSON does not hide an unexpected process exit', doctorOutcome(candidateDoctor, candidateDoctorOptions, 2) === 1)
+assertContract('unverified JSON does not hide a network failure', doctorOutcome(candidateDoctor, candidateDoctorOptions, 1, 'fetch failed: ECONNRESET') === 2)
+
+function rawDoctorError(stdout, stderr = '') {
+  try {
+    validateDoctorResult({ status: 1, stdout, stderr }, '/fixture-home', '/fixture-repo', candidateDoctorOptions)
+    return undefined
+  } catch (error) {
+    return error
+  }
+}
+for (const [name, stdout, shape] of [
+  ['empty output', '  \n', 'empty'],
+  ['multiline output', 'fixture-private-text\n{}\n', 'multiline'],
+  ['malformed JSON', '{"private":"fixture-private-text"', 'invalid-json'],
+]) {
+  const error = rawDoctorError(stdout)
+  assertContract(`issue 211: ${name} remains a typed failure`, error instanceof CompatibilityCheckError)
+  assertContract(`issue 211: ${name} has content-free shape diagnostics`, error?.message.includes(`shape=${shape}`)
+    && error.message.includes(`bytes=${Buffer.byteLength(stdout, 'utf8')}`)
+    && !error.message.includes('fixture-private-text'))
+}
+assertContract('issue 211: duplicate JSON reports remain rejected', rawDoctorError(`${JSON.stringify(candidateDoctor)}\n${JSON.stringify(candidateDoctor)}`) instanceof CompatibilityCheckError)
+assertContract('issue 211: terminal CRLF is accepted without relaxing the single-report contract', (() => {
+  try {
+    return validateDoctorResult({ status: 1, stdout: `${JSON.stringify(candidateDoctor)}\r\n`, stderr: '' }, '/fixture-home', '/fixture-repo', candidateDoctorOptions).schemaVersion === 1
+  } catch { return false }
+})())
+
+const missingPeerStderr = "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/schemastery' imported from /fixture-home/private/entry.js\nfixture-private-token\n"
+const missingPeerError = rawDoctorError('', missingPeerStderr)
+assertContract('issue 211: missing declared peer is not masked by an empty JSON diagnostic',
+  missingPeerError instanceof CompatibilityCheckError
+  && missingPeerError.message.includes('ERR_MODULE_NOT_FOUND')
+  && missingPeerError.message.includes('@deepseek-ai/schemastery'))
+assertContract('issue 211: declared-host doctor reports only the missing declared peer', (() => {
+  try {
+    validateDoctorResult({ status: 1, stdout: '', stderr: missingPeerStderr }, '/fixture-home', '/fixture-repo', { dshVersion: '0.1.7-rc.1' })
+    return false
+  } catch (error) {
+    return error instanceof CompatibilityCheckError && error.message.includes('package=@deepseek-ai/schemastery')
+      && !error.message.includes('/fixture-home') && !error.message.includes('fixture-private-token')
+  }
+})())
+assertContract('issue 211: startup diagnosis does not expose other stderr or private paths',
+  !missingPeerError.message.includes('/fixture-home') && !missingPeerError.message.includes('fixture-private-token'))
+for (const stderr of [
+  "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'fixture-private-name' imported from /fixture-home/private.js",
+  "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/schemastery' imported from x\nError [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/cordis' imported from y",
+  "Cannot find package '@deepseek-ai/schemastery' imported from x",
+]) {
+  const error = rawDoctorError('', stderr)
+  assertContract('issue 211: unknown or ambiguous startup diagnostics remain content-free failures',
+    error instanceof CompatibilityCheckError && error.message.includes('shape=empty')
+    && !error.message.includes('fixture-private') && !error.message.includes('package='))
+}
+assertContract('issue 211: startup evidence never makes nonempty invalid stdout acceptable',
+  rawDoctorError('not-json', missingPeerStderr)?.message.includes('shape=invalid-json'))
+assertContract('issue 211: startup evidence retains infrastructure precedence',
+  installCheckExitCode(rawDoctorError('', `${missingPeerStderr}fetch failed: ECONNRESET`)) === 2)
+assertContract('issue 211: valid unverified report still follows the existing schema gate',
+  doctorOutcome(candidateDoctor, candidateDoctorOptions, 1, missingPeerStderr) === 'continue-runtime')
+
 const runtimeProjection = validateRuntimeProjection(
   [{ id: 'openai-codex', name: 'OpenAI Codex' }],
   [{
@@ -293,7 +407,7 @@ const supersededFixture = await runSupersededCandidateFixture()
 assertContract(
   'issue 86 regression: an older channel is skipped before the isolated checker runs',
   supersededFixture.status === 0
-    && supersededFixture.report.status === 'pass'
+    && supersededFixture.report.status === 'skipped'
     && supersededFixture.report.classification === 'not-newer'
     && supersededFixture.report.stage === 'compare-candidate',
 )

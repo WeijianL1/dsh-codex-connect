@@ -6,10 +6,18 @@ import type { Context } from '@deepseek-ai/cordis'
 import { readOpenAICodexRequestAuth } from './auth.ts'
 import {
   OPENAI_CODEX_REAUTH_REQUIRED_CODE,
-} from './usage.ts'
+} from './auth-error.ts'
 import type { OpenAICodexCredentialStore } from './store.ts'
 import { OPENAI_CODEX_PROVIDER } from './store.ts'
 import type { OpenAICodexProxyManager } from './provider-proxy.ts'
+import type { OpenAICodexBackendRequests } from './backend-request.ts'
+import { prepareOpenAICodexBackendHeaders } from './backend-request-policy.ts'
+import { readRetryAfterMs } from './request-backoff.ts'
+import { DEFAULT_OPENAI_CODEX_IMAGE_MODEL_HINT, parseOpenAICodexImageModelHint } from './settings-contract.ts'
+import { IMAGE_EDIT_MAX_REQUEST_BYTES, snapshotImageEditRequest } from './image-edit-request.ts'
+import type { ImageEditRequest, InlineEditImage } from './image-edit-request.ts'
+
+export type { ImageEditRequest } from './image-edit-request.ts'
 
 /** Cordis service name owned by the core plugin fiber. */
 export const OPENAI_CODEX_TRANSPORT_SERVICE = 'openaiCodexTransport'
@@ -19,6 +27,9 @@ export const OPENAI_CODEX_TRANSPORT_API_VERSION = 1 as const
 
 /** Stage-zero verified image-generation endpoint. */
 export const OPENAI_CODEX_IMAGE_GENERATION_URL = 'https://chatgpt.com/backend-api/codex/images/generations'
+
+/** Independent edit endpoint used by the official Codex Images client. */
+export const OPENAI_CODEX_IMAGE_EDIT_URL = 'https://chatgpt.com/backend-api/codex/images/edits'
 
 /** Network deadline covering the request and bounded response read. */
 export const OPENAI_CODEX_IMAGE_REQUEST_TIMEOUT_MS = 120_000
@@ -131,6 +142,11 @@ export interface OpenAICodexTransportV1 {
     input: ImageGenerationRequest,
     context: ImageRequestContext,
   ): Promise<ImageGenerationResponse>
+  /** Additive capability: an older v1 service may not support editing. Never fall back. */
+  editImages?(
+    input: ImageEditRequest,
+    context: ImageRequestContext,
+  ): Promise<ImageGenerationResponse>
 }
 
 function responseTooLarge(): OpenAICodexTransportError {
@@ -171,9 +187,9 @@ export async function readOpenAICodexBoundedBody(response: Response, maxBytes: n
 }
 
 function retryAfterSeconds(response: Response): number | undefined {
-  const value = response.headers.get('retry-after')
-  if (value === null || !/^\d+$/u.test(value)) return undefined
-  const seconds = Number(value)
+  const milliseconds = readRetryAfterMs(response.headers)
+  if (milliseconds === undefined || !Number.isFinite(milliseconds)) return undefined
+  const seconds = Math.ceil(milliseconds / 1_000)
   return Number.isSafeInteger(seconds) ? seconds : undefined
 }
 
@@ -238,6 +254,8 @@ export class OpenAICodexTransport extends Service implements OpenAICodexTranspor
     private readonly credentials: OpenAICodexCredentialStore,
     private readonly proxyManager?: OpenAICodexProxyManager,
     private readonly resolveProxyUrl: () => string | undefined = () => undefined,
+    private readonly resolveImageModelHint: () => string = () => DEFAULT_OPENAI_CODEX_IMAGE_MODEL_HINT,
+    private readonly backendRequests?: OpenAICodexBackendRequests,
   ) {
     super(ctx, OPENAI_CODEX_TRANSPORT_SERVICE)
   }
@@ -246,13 +264,54 @@ export class OpenAICodexTransport extends Service implements OpenAICodexTranspor
     input: ImageGenerationRequest,
     context: ImageRequestContext,
   ): Promise<ImageGenerationResponse> {
-    const operation = () => this.generateImagesWithoutProxy(input, context)
+    return this.requestImages(input, context)
+  }
+
+  async editImages(
+    input: ImageEditRequest,
+    context: ImageRequestContext,
+  ): Promise<ImageGenerationResponse> {
+    if (isAborted(context.signal)) {
+      throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.canceled)
+    }
+    let snapshot: ReturnType<typeof snapshotImageEditRequest>
+    try {
+      snapshot = snapshotImageEditRequest(input)
+    } catch {
+      throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.invalidRequest)
+    }
+    return this.requestImages({ prompt: snapshot.prompt }, context, snapshot.images)
+  }
+
+  private async requestImages(
+    input: ImageGenerationRequest,
+    context: ImageRequestContext,
+    images?: readonly InlineEditImage[],
+  ): Promise<ImageGenerationResponse> {
+    if (this.backendRequests !== undefined) {
+      try {
+        return await this.backendRequests.run(
+          { lane: 'image', signal: context.signal, timeoutMs: OPENAI_CODEX_IMAGE_REQUEST_TIMEOUT_MS },
+          request => this.generateImagesWithoutProxy(input, { signal: request.signal }, request.fetch, images),
+        )
+      } catch (error: unknown) {
+        if (isOpenAICodexTransportError(error)) throw error
+        if (isAborted(context.signal)) throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.canceled)
+        if (error instanceof DOMException && error.name === 'TimeoutError') {
+          throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.timeout)
+        }
+        throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.networkError)
+      }
+    }
+    const operation = () => this.generateImagesWithoutProxy(input, context, globalThis.fetch, images)
     return this.proxyManager?.run(this.resolveProxyUrl(), operation) ?? operation()
   }
 
   private async generateImagesWithoutProxy(
     input: ImageGenerationRequest,
     context: ImageRequestContext,
+    requestFetch: typeof globalThis.fetch = globalThis.fetch,
+    images?: readonly InlineEditImage[],
   ): Promise<ImageGenerationResponse> {
     if (typeof input?.prompt !== 'string' || input.prompt.trim().length === 0
       || input.prompt.length > OPENAI_CODEX_IMAGE_PROMPT_MAX_LENGTH) {
@@ -260,6 +319,17 @@ export class OpenAICodexTransport extends Service implements OpenAICodexTranspor
     }
     if (isAborted(context.signal)) {
       throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.canceled)
+    }
+    let imageModelHint: string
+    try {
+      imageModelHint = parseOpenAICodexImageModelHint(this.resolveImageModelHint()) || IMAGE_ROUTE_HINT_MODEL
+    } catch {
+      throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.invalidRequest)
+    }
+
+    const body = JSON.stringify({ model: imageModelHint, prompt: input.prompt, ...(images === undefined ? {} : { images }) })
+    if (images !== undefined && Buffer.byteLength(body, 'utf8') > IMAGE_EDIT_MAX_REQUEST_BYTES) {
+      throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.invalidRequest)
     }
 
     const credentials = await this.credentials.captureActiveAccount()
@@ -289,27 +359,27 @@ export class OpenAICodexTransport extends Service implements OpenAICodexTranspor
     const startedAt = Date.now()
     const controller = new AbortController()
     let timedOut = false
-    const onCallerAbort = (): void => controller.abort()
+    const onCallerAbort = (): void => { controller.abort(context.signal?.reason) }
     context.signal?.addEventListener('abort', onCallerAbort, { once: true })
-    if (isAborted(context.signal)) controller.abort()
+    if (isAborted(context.signal)) controller.abort(context.signal?.reason)
     const timer = setTimeout(() => {
       timedOut = true
-      controller.abort()
+      controller.abort(new DOMException('Image request deadline exceeded', 'TimeoutError'))
     }, OPENAI_CODEX_IMAGE_REQUEST_TIMEOUT_MS)
 
     try {
-      const response = await fetch(OPENAI_CODEX_IMAGE_GENERATION_URL, {
+      const { headers } = prepareOpenAICodexBackendHeaders({
+        authorization: `Bearer ${access}`,
+        'chatgpt-account-id': accountId,
+        'content-type': 'application/json',
+        accept: 'application/json',
+      }, 'plugin')
+      const response = await requestFetch(images === undefined ? OPENAI_CODEX_IMAGE_GENERATION_URL : OPENAI_CODEX_IMAGE_EDIT_URL, {
         method: 'POST',
         redirect: 'manual',
         signal: controller.signal,
-        headers: {
-          authorization: `Bearer ${access}`,
-          'chatgpt-account-id': accountId,
-          'content-type': 'application/json',
-          accept: 'application/json',
-          'user-agent': 'dsh-codex-connect',
-        },
-        body: JSON.stringify({ model: IMAGE_ROUTE_HINT_MODEL, prompt: input.prompt }),
+        headers,
+        body,
       })
       if (!response.ok) {
         try {
@@ -323,17 +393,20 @@ export class OpenAICodexTransport extends Service implements OpenAICodexTranspor
         throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.malformedResponse)
       }
       const bytes = await readOpenAICodexBoundedBody(response, OPENAI_CODEX_IMAGE_MAX_RESPONSE_BYTES)
-      const images = parseSuccess(bytes)
+      const outputImages = parseSuccess(bytes)
       return {
         apiVersion: OPENAI_CODEX_TRANSPORT_API_VERSION,
         traceId,
         elapsedMs: Date.now() - startedAt,
         responseBytes: bytes.byteLength,
-        images,
+        images: outputImages,
       }
     } catch (error: unknown) {
       if (isOpenAICodexTransportError(error)) throw error
       if (isAborted(context.signal)) {
+        if (context.signal?.reason instanceof DOMException && context.signal.reason.name === 'TimeoutError') {
+          throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.timeout)
+        }
         throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.canceled)
       }
       if (timedOut) throw new OpenAICodexTransportError(OPENAI_CODEX_TRANSPORT_ERROR_CODES.timeout)

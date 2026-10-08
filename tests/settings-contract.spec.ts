@@ -3,15 +3,45 @@ import {
   DEFAULT_OPENAI_CODEX_PROXY_URL,
   DEFAULT_OPENAI_CODEX_SETTINGS,
   decodeOpenAICodexSettings,
+  isValidOpenAICodexImageModelHint,
   isValidOpenAICodexContextWindowOverrides,
   resolveOpenAICodexProxyUrl,
   resolveOpenAICodexSettings,
 } from '../src/settings-contract.ts'
 import { Config } from '../src/index.ts'
+import type { OpenAICodexSettingsInput } from '../src/settings-contract.ts'
+
+function configSettings(config: ReturnType<typeof Config>): OpenAICodexSettingsInput {
+  const values = Object.fromEntries(Object.entries(config).flatMap(([key, value]) => {
+    if (key === 'oauthTimeoutMs') return []
+    return [[key, value !== null && typeof value === 'object' && 'get' in value ? value.get() : value]]
+  }))
+  return values as OpenAICodexSettingsInput
+}
 
 describe('OpenAI Codex proxy settings contract', () => {
+  it.each(['gpt-image-2\n', 'gpt-image-2\r', 'gpt-image-2\u2028', 'gpt-image-2\u2029', 'a'.repeat(129), 'model\tname'])('rejects padded or oversized image hints on Host and browser: %j', imageModelHint => {
+    expect(isValidOpenAICodexImageModelHint(imageModelHint)).toBe(false)
+    expect(() => Config({ imageModelHint })).toThrow()
+    expect(() => resolveOpenAICodexSettings({ imageModelHint })).toThrow()
+    expect(decodeOpenAICodexSettings({ ...DEFAULT_OPENAI_CODEX_SETTINGS, imageModelHint })).toBeUndefined()
+  })
+
+  it('validates and defaults the optional image model hint', () => {
+    expect(DEFAULT_OPENAI_CODEX_SETTINGS.imageModelHint).toBe('')
+    expect(isValidOpenAICodexImageModelHint('gpt-image-2')).toBe(true)
+    expect(isValidOpenAICodexImageModelHint('')).toBe(true)
+    expect(isValidOpenAICodexImageModelHint('https://evil.example')).toBe(false)
+    expect(isValidOpenAICodexImageModelHint('bad value')).toBe(false)
+    expect(decodeOpenAICodexSettings({ ...DEFAULT_OPENAI_CODEX_SETTINGS, imageModelHint: 'custom_model' })?.imageModelHint).toBe('custom_model')
+    expect(decodeOpenAICodexSettings({ ...DEFAULT_OPENAI_CODEX_SETTINGS, imageModelHint: 'bad value' })).toBeUndefined()
+  })
   it('keeps fresh and legacy settings on direct connection', () => {
     expect(DEFAULT_OPENAI_CODEX_SETTINGS.enableProxy).toBe(false)
+    expect(DEFAULT_OPENAI_CODEX_SETTINGS.enableReserveFallback).toBe(false)
+    expect(DEFAULT_OPENAI_CODEX_SETTINGS.enableNewSessionFastMode).toBe(false)
+    expect(DEFAULT_OPENAI_CODEX_SETTINGS.enableNewSubagentFastMode).toBe(false)
+    expect(DEFAULT_OPENAI_CODEX_SETTINGS.enableNativeCompaction).toBe(false)
     expect(DEFAULT_OPENAI_CODEX_SETTINGS.autoReviewDisclosureAcknowledged).toBe(false)
     expect(DEFAULT_OPENAI_CODEX_SETTINGS.enableAutoReview).toBe(false)
     expect(DEFAULT_OPENAI_CODEX_SETTINGS.proxyUrl).toBe(DEFAULT_OPENAI_CODEX_PROXY_URL)
@@ -24,10 +54,58 @@ describe('OpenAI Codex proxy settings contract', () => {
       searchMaxOutputTokens: 10_000,
     })
     expect(legacy?.enableProxy).toBe(false)
+    expect(legacy?.enableReserveFallback).toBe(false)
+    expect(legacy?.enableNewSessionFastMode).toBe(false)
+    expect(legacy?.enableNewSubagentFastMode).toBe(false)
+    expect(legacy?.enableNativeCompaction).toBe(false)
     expect(legacy?.proxyUrl).toBe(DEFAULT_OPENAI_CODEX_PROXY_URL)
     expect(legacy?.autoReviewDisclosureAcknowledged).toBe(false)
     expect(legacy?.enableAutoReview).toBe(false)
     expect(resolveOpenAICodexProxyUrl(legacy ?? {})).toBeUndefined()
+  })
+
+  it.each(['yes', 1, {}, []])('rejects a non-boolean Reserve fallback setting: %j', enableReserveFallback => {
+    expect(() => Config({ enableReserveFallback } as never)).toThrow()
+    expect(decodeOpenAICodexSettings({
+      ...DEFAULT_OPENAI_CODEX_SETTINGS,
+      enableReserveFallback,
+    })).toBeUndefined()
+  })
+
+  it('rejects a null Reserve fallback in a decoded browser snapshot', () => {
+    expect(decodeOpenAICodexSettings({
+      ...DEFAULT_OPENAI_CODEX_SETTINGS,
+      enableReserveFallback: null,
+    })).toBeUndefined()
+  })
+
+  it('keeps Reserve fallback opt-in across Host and browser settings', () => {
+    expect(Config({}).enableReserveFallback.get()).toBe(false)
+    expect(resolveOpenAICodexSettings({}).enableReserveFallback).toBe(false)
+    expect(Config({ enableReserveFallback: true }).enableReserveFallback.get()).toBe(true)
+    expect(decodeOpenAICodexSettings({
+      ...DEFAULT_OPENAI_CODEX_SETTINGS,
+      enableReserveFallback: true,
+    })?.enableReserveFallback).toBe(true)
+  })
+
+  it('keeps top-level and subagent Fast Mode defaults separate and rejects malformed values', () => {
+    const defaults = resolveOpenAICodexSettings({})
+    expect(defaults.enableNewSessionFastMode).toBe(false)
+    expect(defaults.enableNewSubagentFastMode).toBe(false)
+    expect(configSettings(Config({ enableNewSessionFastMode: true }))).toMatchObject({
+      enableNewSessionFastMode: true,
+      enableNewSubagentFastMode: false,
+    })
+    expect(decodeOpenAICodexSettings({
+      ...DEFAULT_OPENAI_CODEX_SETTINGS,
+      enableNewSubagentFastMode: true,
+    })).toMatchObject({ enableNewSessionFastMode: false, enableNewSubagentFastMode: true })
+    for (const field of ['enableNewSessionFastMode', 'enableNewSubagentFastMode'] as const) {
+      expect(() => Config({ [field]: 'on' } as never)).toThrow()
+      expect(() => resolveOpenAICodexSettings({ [field]: 'on' } as never)).toThrow()
+      expect(decodeOpenAICodexSettings({ ...DEFAULT_OPENAI_CODEX_SETTINGS, [field]: 'on' })).toBeUndefined()
+    }
   })
 
   it('rejects non-boolean Auto-review settings while preserving the default-off legacy value', () => {
@@ -40,10 +118,10 @@ describe('OpenAI Codex proxy settings contract', () => {
       ...DEFAULT_OPENAI_CODEX_SETTINGS,
       autoReviewDisclosureAcknowledged: 'yes',
     })).toBeUndefined()
-    expect(Config({
+    expect(configSettings(Config({
       autoReviewDisclosureAcknowledged: true,
       enableAutoReview: true,
-    })).toMatchObject({
+    }))).toMatchObject({
       autoReviewDisclosureAcknowledged: true,
       enableAutoReview: true,
     })
@@ -114,9 +192,9 @@ describe('OpenAI Codex proxy settings contract', () => {
     Object.fromEntries(Array.from({ length: 256 }, (_, index) => [`model-${index}`, 300_000])),
   ])('accepts the same structural map on Host and browser: %j', overrides => {
     expect(isValidOpenAICodexContextWindowOverrides(overrides)).toBe(true)
-    const config = Config({ contextWindowOverrides: overrides })
-    expect(decodeOpenAICodexSettings(config)?.contextWindowOverrides).toEqual(overrides)
-    expect(resolveOpenAICodexSettings(config).contextWindowOverrides).toEqual(overrides)
+    expect(decodeOpenAICodexSettings({ ...DEFAULT_OPENAI_CODEX_SETTINGS, contextWindowOverrides: overrides })?.contextWindowOverrides)
+      .toEqual(overrides)
+    expect(resolveOpenAICodexSettings({ contextWindowOverrides: overrides }).contextWindowOverrides).toEqual(overrides)
   })
 
   it.each([
@@ -133,8 +211,8 @@ describe('OpenAI Codex proxy settings contract', () => {
 
   it('preserves the Host null sentinel and resolves it as disabled in both consumers', () => {
     const host = Config({ contextWindowOverrides: null })
-    expect(host.contextWindowOverrides).toBeNull()
-    expect(resolveOpenAICodexSettings(host).contextWindowOverrides).toBeUndefined()
+    expect(host.contextWindowOverrides.get()).toBeNull()
+    expect(resolveOpenAICodexSettings(configSettings(host)).contextWindowOverrides).toBeUndefined()
     expect(decodeOpenAICodexSettings({ ...DEFAULT_OPENAI_CODEX_SETTINGS, contextWindowOverrides: null })?.contextWindowOverrides).toBeUndefined()
     expect(resolveOpenAICodexSettings({ contextWindowOverrides: null }).contextWindowOverrides).toBeUndefined()
   })
@@ -142,10 +220,10 @@ describe('OpenAI Codex proxy settings contract', () => {
   it('preserves per-model null masks on Host and removes them only in resolved settings', () => {
     const input = { 'gpt-5.6-sol': null, 'gpt-5.6-terra': 300_000 }
     const host = Config({ contextWindowOverrides: input })
-    expect(host.contextWindowOverrides).toEqual(input)
-    expect(host.contextWindowOverrides).not.toBe(input)
-    expect(resolveOpenAICodexSettings(host).contextWindowOverrides).toEqual({ 'gpt-5.6-terra': 300_000 })
-    expect(decodeOpenAICodexSettings(host)?.contextWindowOverrides).toEqual({ 'gpt-5.6-terra': 300_000 })
+    expect(host.contextWindowOverrides.get()).toEqual(input)
+    expect(host.contextWindowOverrides.get()).not.toBe(input)
+    expect(resolveOpenAICodexSettings(configSettings(host)).contextWindowOverrides).toEqual({ 'gpt-5.6-terra': 300_000 })
+    expect(decodeOpenAICodexSettings(configSettings(host))?.contextWindowOverrides).toEqual({ 'gpt-5.6-terra': 300_000 })
     expect(isValidOpenAICodexContextWindowOverrides({ '': null })).toBe(false)
     expect(isValidOpenAICodexContextWindowOverrides(Object.fromEntries(Array.from({ length: 257 }, (_, i) => [`model-${i}`, null])))).toBe(false)
   })

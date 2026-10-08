@@ -14,6 +14,7 @@ import {
   readOpenAICodexBoundedBody,
 } from '../src/transport.ts'
 import { OpenAICodexCredentialStore, OPENAI_CODEX_PROVIDER } from '../src/store.ts'
+import { OpenAICodexBackendRequests } from '../src/backend-request.ts'
 
 let root: string | undefined
 let context: Context | undefined
@@ -50,13 +51,30 @@ async function credentialStore(authenticated = true): Promise<OpenAICodexCredent
   return store
 }
 
-async function transport(authenticated = true): Promise<OpenAICodexTransport> {
+async function transport(
+  authenticated = true,
+  imageModelHint: string | (() => string) = '',
+  authGate?: { entered: () => void; wait: Promise<void> },
+  backendRequests?: OpenAICodexBackendRequests,
+): Promise<OpenAICodexTransport> {
   const store = await credentialStore(authenticated)
+  if (authGate !== undefined) {
+    const capture = store.captureActiveAccount.bind(store)
+    vi.spyOn(store, 'captureActiveAccount').mockImplementation(async () => {
+      authGate.entered()
+      await authGate.wait
+      return capture()
+    })
+  }
   const ctx = new Context()
   context = ctx
   let service: OpenAICodexTransport | undefined
   await ctx.plugin((pluginCtx) => {
-    service = new OpenAICodexTransport(pluginCtx, store)
+    service = new OpenAICodexTransport(
+      pluginCtx, store, undefined, undefined,
+      typeof imageModelHint === 'function' ? imageModelHint : () => imageModelHint,
+      backendRequests,
+    )
   })
   if (service === undefined) throw new Error('transport service did not start')
   return service
@@ -93,6 +111,68 @@ describe('OpenAI Codex image transport', () => {
     expect(headers.get('chatgpt-account-id')).toBe('account-1')
     expect(JSON.stringify(result)).not.toContain('account-1')
     expect(JSON.stringify(result)).not.toContain('access-secret')
+  })
+
+  it('routes image generation through the shared governor with the plugin identity policy', async () => {
+    const requests = new OpenAICodexBackendRequests()
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => jsonResponse({ data: [{ b64_json: 'aGVsbG8=' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await (await transport(true, '', undefined, requests)).generateImages({ prompt: 'governed' }, {})
+      const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers)
+      expect(headers.get('originator')).toBe('deepseek-harness')
+      expect(headers.get('user-agent')).toBe('dsh-codex-connect')
+      expect(headers.get('x-client-request-id')).toMatch(/^[0-9a-f-]{36}$/u)
+    } finally { requests.dispose() }
+  })
+
+  it.each(['gpt-image-custom', 'gpt_image.v2'])('sends a valid profile image model hint once', async imageModelHint => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => jsonResponse({ data: [{ b64_json: 'aGVsbG8=' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await (await transport(true, imageModelHint)).generateImages({ prompt: 'test' }, {})
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ model: imageModelHint, prompt: 'test' })
+  })
+
+  it('uses the default route after resetting the profile hint', async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => jsonResponse({ data: [{ b64_json: 'aGVsbG8=' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await (await transport(true, '')).generateImages({ prompt: 'test' }, {})
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)).model).toBe('gpt-image-2')
+  })
+
+  it('captures the hint for an in-flight request and reads the updated hint next time', async () => {
+    let imageModelHint = 'first-route'
+    let release!: () => void
+    const entered = new Promise<void>(resolve => { release = resolve })
+    let authEntered!: () => void
+    const authStarted = new Promise<void>(resolve => { authEntered = resolve })
+    const bodies: Array<{ model: string; prompt: string }> = []
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as { model: string; prompt: string })
+      if (bodies.length === 1) await entered
+      return jsonResponse({ data: [{ b64_json: 'aGVsbG8=' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const service = await transport(true, () => imageModelHint, { entered: authEntered, wait: entered })
+    const first = service.generateImages({ prompt: 'first' }, {})
+    await authStarted
+    expect(bodies).toHaveLength(0)
+    imageModelHint = 'second-route'
+    release()
+    await first
+    await service.generateImages({ prompt: 'second' }, {})
+    expect(bodies).toEqual([
+      { model: 'first-route', prompt: 'first' },
+      { model: 'second-route', prompt: 'second' },
+    ])
+  })
+
+  it.each(['https://evil.example', 'bad value', '1'.repeat(129), '-bad', '\u0000bad'])('rejects an invalid route hint before auth', async imageModelHint => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const failure = await (await transport(false, imageModelHint)).generateImages({ prompt: 'test' }, {}).catch((error: unknown) => error)
+    expectCode(failure, OPENAI_CODEX_TRANSPORT_ERROR_CODES.invalidRequest)
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it.each(['', '   ', 'x'.repeat(32_001)])('rejects an invalid prompt before dispatch', async prompt => {

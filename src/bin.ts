@@ -3,21 +3,18 @@
 
 import { spawn } from 'node:child_process'
 import { realpathSync } from 'node:fs'
+import { basename, isAbsolute } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
 import type { AuthEvent, AuthPrompt } from '@earendil-works/pi-ai'
-import {
-  diagnoseOpenAICodex,
-  loginOpenAICodex,
-  logoutOpenAICodex,
-  migrateOpenAICodexSearchHistory,
-  openAICodexAuthPath,
-  openAICodexAuthStatus,
-} from './index.ts'
-import { CODEX_CONNECT_VERSION } from './doctor.ts'
+import { CODEX_CONNECT_VERSION, diagnoseOpenAICodex } from './doctor.ts'
+import { loginOpenAICodex, logoutOpenAICodex, openAICodexAuthStatus } from './auth.ts'
+import { migrateOpenAICodexSearchHistory } from './history-migration.ts'
+import { openAICodexAuthPath } from './store.ts'
 import { normalizeTrustedOrigin, OpenAICodexTrustedOriginsStore } from './trusted-origins.ts'
 import { runCapabilityCommand } from './capability-cli.ts'
 import { runAutoReviewProbeCommand } from './auto-review-cli.ts'
+import { runRequestMetricsCommand } from './request-metrics-cli.ts'
 import { publicAuthError as safeMessage } from './auth-error.ts'
 
 type Action = 'doctor' | 'login' | 'logout' | 'migrate-history' | 'status' | 'trust-origin' | 'trusted-origins' | 'untrust-origin'
@@ -91,14 +88,16 @@ async function answerPrompt(
 function printHelp(): void {
   process.stdout.write([
     'Usage: dsh-codex-connect <doctor|login|logout|status> [--device-code|--json]',
+    '       dsh-codex-connect doctor [--install-anchor <absolute-dsh-package.json>] [--json]',
     '       dsh-codex-connect migrate-history [--apply --confirm-stopped] [--root <path>] [--json]',
     '       dsh-codex-connect trust-origin <origin>',
     '       dsh-codex-connect trusted-origins [--json]',
     '       dsh-codex-connect untrust-origin <origin>',
     '       dsh-codex-connect capabilities [--model <catalog-id>] [--probe] [--proxy <http(s)-origin>] [--timeout-ms <1..60000>] [--json]',
     '       dsh-codex-connect auto-review-probe [--proxy <http(s)-origin>] [--timeout-ms <1..60000>] [--json]',
+    '       dsh-codex-connect metrics --file <journal.jsonl> [--file <journal.jsonl>] [--session <DSH-session-id>] [--json]',
     '',
-    '  doctor         inspect secret-free runtime and OAuth file metadata',
+    '  doctor         inspect secret-free runtime and OAuth file metadata; an explicit DSH anchor verifies host package versions',
     '  auto-review-probe test the hidden approval reviewer with one synthetic no-op',
     '  login          sign in with a separate ChatGPT OAuth session',
     '  logout         remove the dsh credential without changing ~/.codex',
@@ -153,6 +152,7 @@ export async function run(argv: readonly string[]): Promise<number> {
   const [rawAction, ...flags] = argv
   if (rawAction === 'capabilities') return runCapabilityCommand(flags)
   if (rawAction === 'auto-review-probe') return runAutoReviewProbeCommand(flags)
+  if (rawAction === 'metrics') return runRequestMetricsCommand(flags)
   const actions: readonly Action[] = ['doctor', 'login', 'logout', 'migrate-history', 'status', 'trust-origin', 'trusted-origins', 'untrust-origin']
   if (!actions.includes(rawAction as Action)) {
     process.stderr.write(`dsh-codex-connect: expected doctor, login, logout, migrate-history, status, trust-origin, trusted-origins, or untrust-origin; got ${JSON.stringify(rawAction)}\n`)
@@ -164,10 +164,25 @@ export async function run(argv: readonly string[]): Promise<number> {
   const deviceCode = optionFlags.includes('--device-code')
   const jsonOutput = optionFlags.includes('--json')
   let migrationRoot: string | undefined
+  let installAnchor: string | undefined
   let migrationApply = false
   let migrationConfirmStopped = false
   const unknown: string[] = []
-  if (action === 'migrate-history') {
+  if (action === 'doctor') {
+    for (let index = 0; index < optionFlags.length; index += 1) {
+      const flag = optionFlags[index]
+      if (flag === '--json') continue
+      if (flag === '--install-anchor' && installAnchor === undefined) {
+        const value = optionFlags[index + 1]
+        if (value !== undefined && isAbsolute(value) && basename(value) === 'package.json') {
+          installAnchor = value
+          index += 1
+          continue
+        }
+      }
+      unknown.push(flag ?? '')
+    }
+  } else if (action === 'migrate-history') {
     for (let index = 0; index < optionFlags.length; index += 1) {
       const flag = optionFlags[index]
       if (flag === '--apply') {
@@ -196,13 +211,14 @@ export async function run(argv: readonly string[]): Promise<number> {
     || (jsonOutput && (action === 'login' || action === 'logout' || deviceCode))
     || (action === 'migrate-history' && (migrationConfirmStopped && !migrationApply || migrationApply && !migrationConfirmStopped))
     || ((action === 'trust-origin' || action === 'untrust-origin') && (originArgument === undefined || optionFlags.length !== 0))) {
-    process.stderr.write(`dsh-codex-connect: invalid options for ${action}: ${flags.join(' ')}\n`)
+    process.stderr.write(`dsh-codex-connect: invalid options for ${action}\n`)
     return 1
   }
   try {
     switch (action) {
       case 'doctor': {
-        const report = await diagnoseOpenAICodex()
+        const report = await diagnoseOpenAICodex(installAnchor === undefined
+          ? undefined : { compatibilityOptions: { installAnchor } })
         if (jsonOutput) {
           printJson(doctorJson(report))
           return doctorExitCode(report)

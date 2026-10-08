@@ -1,22 +1,33 @@
 import z from "@deepseek-ai/schemastery";
 import { AuthInteraction, Credential, CredentialInfo, CredentialStore, OAuthCredential } from "@earendil-works/pi-ai";
+import { GenerateOptions, StreamChunk } from "@deepseek-ai/dsh-llm";
+import { Context, Service, Volatile } from "@deepseek-ai/cordis";
 import "@deepseek-ai/dsh-tools";
-import { Context, Service } from "@deepseek-ai/cordis";
 import { WebSearchProvider, WebSearchRequest, WebSearchResult } from "@deepseek-ai/dsh-web";
+//#region src/message-source.d.ts
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-codex-connect': {
+      kind: 'dsh-codex-connect';
+      plugin: string;
+    };
+  }
+}
+//#endregion
 //#region src/account-profile.d.ts
 type OpenAICodexAccountProfileSource = 'oauth' | 'generated';
 //#endregion
 //#region src/store.d.ts
 /** Provider route and pi-ai provider id owned by this bundle. */
-declare const OPENAI_CODEX_PROVIDER = "openai-codex";
+export declare const OPENAI_CODEX_PROVIDER = "openai-codex";
 /** Basename of the OAuth document inside the Harness home. */
-declare const OPENAI_CODEX_AUTH_FILENAME = ".openai-codex-auth.json";
+export declare const OPENAI_CODEX_AUTH_FILENAME = ".openai-codex-auth.json";
 /** Maximum number of stored OpenAI Codex accounts. */
-declare const OPENAI_CODEX_ACCOUNT_LIMIT = 16;
+export declare const OPENAI_CODEX_ACCOUNT_LIMIT = 16;
 /** Maximum serialized credential document size. */
-declare const OPENAI_CODEX_AUTH_DOCUMENT_LIMIT: number;
+export declare const OPENAI_CODEX_AUTH_DOCUMENT_LIMIT: number;
 /** Suffix used for the one-time version-1 rollback copy. */
-declare const OPENAI_CODEX_AUTH_V1_BACKUP_SUFFIX = ".v1-backup";
+export declare const OPENAI_CODEX_AUTH_V1_BACKUP_SUFFIX = ".v1-backup";
 interface OpenAICodexAccountSummary {
   accountKey: string;
   displayName: string;
@@ -34,9 +45,9 @@ interface CapturedOpenAICodexAccount extends CredentialStore {
  * @param dshHome - optional Harness-home override.
  * @returns the absolute owner-only document path.
  */
-declare function openAICodexAuthPath(dshHome?: string): string;
+export declare function openAICodexAuthPath(dshHome?: string): string;
 /** File-backed pi-ai store scoped to the single OpenAI Codex provider. */
-declare class OpenAICodexCredentialStore implements CredentialStore {
+export declare class OpenAICodexCredentialStore implements CredentialStore {
   /** Absolute credential document path. */
   readonly filename: string;
   /** Owner-only version-1 rollback copy, created at the first migration write. */
@@ -79,13 +90,13 @@ declare class OpenAICodexCredentialStore implements CredentialStore {
 //#region src/provider-proxy.d.ts
 /** Explicit Codex-only HTTP(S) proxying, probing, and lifecycle ownership. */
 /** Canonical first-party endpoint used for a no-auth, no-model reachability probe. */
-declare const OPENAI_CODEX_PROXY_PROBE_URL = "https://chatgpt.com/backend-api/codex";
+export declare const OPENAI_CODEX_PROXY_PROBE_URL = "https://chatgpt.com/backend-api/codex";
 /** Upper bound for one candidate probe, including CONNECT and response headers. */
-declare const OPENAI_CODEX_PROXY_PROBE_TIMEOUT_MS = 3000;
+export declare const OPENAI_CODEX_PROXY_PROBE_TIMEOUT_MS = 3000;
 /** Maximum number of candidates considered by automatic detection. */
-declare const OPENAI_CODEX_PROXY_CANDIDATE_LIMIT = 8;
+export declare const OPENAI_CODEX_PROXY_CANDIDATE_LIMIT = 8;
 /** Bounded local candidates documented by the settings UI. */
-declare const OPENAI_CODEX_LOCAL_PROXY_CANDIDATES: readonly ["http://127.0.0.1:7890", "http://127.0.0.1:7897", "http://127.0.0.1:10809"];
+export declare const OPENAI_CODEX_LOCAL_PROXY_CANDIDATES: readonly ["http://127.0.0.1:7890", "http://127.0.0.1:7897", "http://127.0.0.1:10809"];
 /** Stable probe classifications safe to display in the browser. */
 type OpenAICodexProxyProbeClassification = 'reachable' | 'upstream-authentication-required' | 'proxy-authentication-required' | 'dns-failure' | 'connection-refused' | 'timeout' | 'tls-failure' | 'connect-failure' | 'invalid';
 /** Result of testing one proxy origin. */
@@ -100,9 +111,9 @@ interface OpenAICodexProxyProbeResult {
   status?: number;
 }
 /** Return a small, deterministic candidate set; this never scans LAN hosts or ports. */
-declare function listOpenAICodexProxyCandidates(): readonly string[];
+export declare function listOpenAICodexProxyCandidates(): readonly string[];
 /** One plugin instance owns its proxy agents and contributes one global wrapper owner. */
-declare class OpenAICodexProxyManager {
+export declare class OpenAICodexProxyManager {
   private readonly agents;
   private readonly connections;
   private activeOperations;
@@ -129,27 +140,166 @@ declare class OpenAICodexProxyManager {
   deactivate(): Promise<void>;
 }
 /** Probe the bounded automatic candidate set in parallel. */
-declare function detectOpenAICodexProxies(manager: OpenAICodexProxyManager): Promise<readonly OpenAICodexProxyProbeResult[]>;
+export declare function detectOpenAICodexProxies(manager: OpenAICodexProxyManager): Promise<readonly OpenAICodexProxyProbeResult[]>;
+//#endregion
+//#region src/request-metrics.d.ts
+interface RequestMetricUsage {
+  /** Responses input_tokens includes cached input; fields remain null when absent or invalid. */
+  input: number | null;
+  cachedInput: number | null;
+  cacheWrite: number | null;
+  output: number | null;
+  /** Subset of output, never added to output again. */
+  reasoningOutput: number | null;
+}
+type RequestMetricOutcome = 'completed' | 'incomplete' | 'provider-error' | 'http-error' | 'network-error' | 'cancelled' | 'unobserved';
+interface RequestMetricFinish {
+  schemaVersion: 1;
+  event: 'finish';
+  id: string;
+  at: number;
+  elapsedMs: number;
+  status: number | null;
+  outcome: RequestMetricOutcome;
+  usage: RequestMetricUsage;
+  observation: 'observed' | 'missing' | 'oversized' | 'malformed';
+}
+/** One process-local writer; exclusive owner-only file, bounded size, no shared journal mutation. */
+declare class RequestMetrics {
+  private readonly maxBytes;
+  private readonly warn;
+  private readonly scope;
+  private fd;
+  private bytes;
+  private disabled;
+  private readonly journalId;
+  readonly filename: string;
+  constructor(directory: string, maxBytes?: number, warn?: () => void);
+  private stop;
+  private write;
+  /** Release the local journal descriptor; in-flight writes after close are not claimed as recorded. */
+  close(): void;
+  /** Scope each actual adapter call, including compaction/title calls, without rewriting options. */
+  stream(stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>, options: GenerateOptions): AsyncIterable<StreamChunk>;
+  /** Called after admission/reservation, immediately before a real fetch attempt. */
+  begin(lane: OpenAICodexBackendLane, id: string): MetricAttempt;
+}
+/** Records the whole response lifetime, including unread-body cancellation, exactly once. */
+declare class MetricAttempt {
+  private readonly id;
+  private readonly write;
+  private readonly start;
+  private ended;
+  private status;
+  private observer;
+  constructor(id: string, write: (event: RequestMetricFinish) => void);
+  headers(response: Response, expected?: 'sse'): void;
+  feed(value: Uint8Array): void;
+  finish(transport: 'eof' | 'cancelled' | 'network-error'): void;
+}
+//#endregion
+//#region src/backend-request-policy.d.ts
+type OpenAICodexBackendIdentity = 'plugin' | 'preserve' | 'probe';
+interface OpenAICodexBackendResponseMeta {
+  readonly clientRequestId: string;
+  readonly httpStatus: number;
+  readonly httpRequestId?: string;
+  readonly retryAfterMs?: number;
+}
+//#endregion
+//#region src/backend-request.d.ts
+type OpenAICodexBackendLane = 'model' | 'search' | 'quota' | 'image' | 'auto-review';
+type BackendFetch = typeof globalThis.fetch;
+interface OpenAICodexBackendRunOptions {
+  readonly lane: OpenAICodexBackendLane;
+  readonly signal?: AbortSignal | undefined;
+  readonly timeoutMs?: number | undefined;
+}
+interface OpenAICodexBackendFetchOptions {
+  readonly lane: OpenAICodexBackendLane;
+  /** Known successful protocol when the upstream omits its media type; observation only. */
+  readonly responseFormat?: 'sse';
+  readonly identity?: OpenAICodexBackendIdentity;
+  readonly fetch?: BackendFetch;
+  readonly onAttempt?: (meta: Pick<OpenAICodexBackendResponseMeta, 'clientRequestId'>) => void;
+  readonly onResponse?: (meta: OpenAICodexBackendResponseMeta) => void | Promise<void>;
+}
+interface OpenAICodexBackendRunContext {
+  readonly signal: AbortSignal;
+  fetch(input: string | URL | Request, init?: RequestInit, options?: Omit<OpenAICodexBackendFetchOptions, 'lane'>): Promise<Response>;
+}
+/** One plugin instance owns one governor; it never guesses account-level service policy. */
+declare class OpenAICodexBackendRequests {
+  private readonly proxyManager?;
+  private readonly resolveProxyUrl;
+  private readonly maxConcurrent;
+  private readonly beforeAuxiliaryAttempt?;
+  readonly metrics?: RequestMetrics | undefined;
+  /** Optional owner accounting, before auxiliary checks and every actual fetch. */
+  private readonly beforeAttempt?;
+  private active;
+  private readonly waiters;
+  private readonly cooldowns;
+  private readonly lifecycle;
+  private disposed;
+  constructor(proxyManager?: OpenAICodexProxyManager | undefined, resolveProxyUrl?: () => string | undefined, maxConcurrent?: number, beforeAuxiliaryAttempt?: (() => Promise<void>) | undefined, metrics?: RequestMetrics | undefined,
+  /** Optional owner accounting, before auxiliary checks and every actual fetch. */
+  beforeAttempt?: (() => Promise<void>) | undefined);
+  private combinedSignal;
+  private drain;
+  private release;
+  private acquire;
+  private beforeRequest;
+  private admit;
+  private recordResponse;
+  private fetchAttempt;
+  /** Own one logical deadline/proxy scope; each HTTP attempt acquires its own slot. */
+  run<T>(options: OpenAICodexBackendRunOptions, operation: (context: OpenAICodexBackendRunContext) => Promise<T>): Promise<T>;
+  /** Wrap provider-owned fetch while preserving provider identity and stream proxy lifetime. */
+  wrapFetch(options: OpenAICodexBackendFetchOptions): BackendFetch;
+  /** Keep the existing proxy lease for the complete provider stream. */
+  runStream<T extends {
+    result(): Promise<unknown>;
+  }>(operation: () => T): T;
+  /** Abort queued/in-flight managed requests and prevent new admission. */
+  dispose(): void;
+}
+//#endregion
+//#region src/image-format.d.ts
+/** Pure encoded-image header validation for PNG, JPEG, and WebP. */
+type CodexImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp';
+//#endregion
+//#region src/image-edit-request.d.ts
+/** Bytes must already have passed the caller's session/attachment authorization. */
+interface ImageEditInputBytes {
+  readonly data: Uint8Array;
+  readonly mediaType: CodexImageMediaType;
+}
+/** A host-only request. Model-visible attachment IDs are never provider file IDs. */
+interface ImageEditRequest {
+  readonly prompt: string;
+  readonly images: readonly ImageEditInputBytes[];
+}
 //#endregion
 //#region src/transport.d.ts
 /** Cordis service name owned by the core plugin fiber. */
-declare const OPENAI_CODEX_TRANSPORT_SERVICE = "openaiCodexTransport";
+export declare const OPENAI_CODEX_TRANSPORT_SERVICE = "openaiCodexTransport";
 /** Structured contract version used across the core and companion packages. */
-declare const OPENAI_CODEX_TRANSPORT_API_VERSION: 1;
+export declare const OPENAI_CODEX_TRANSPORT_API_VERSION: 1;
 /** Stage-zero verified image-generation endpoint. */
-declare const OPENAI_CODEX_IMAGE_GENERATION_URL = "https://chatgpt.com/backend-api/codex/images/generations";
+export declare const OPENAI_CODEX_IMAGE_GENERATION_URL = "https://chatgpt.com/backend-api/codex/images/generations";
 /** Network deadline covering the request and bounded response read. */
-declare const OPENAI_CODEX_IMAGE_REQUEST_TIMEOUT_MS = 120000;
+export declare const OPENAI_CODEX_IMAGE_REQUEST_TIMEOUT_MS = 120000;
 /** Maximum accepted success-body size: 48 MiB. */
-declare const OPENAI_CODEX_IMAGE_MAX_RESPONSE_BYTES: number;
+export declare const OPENAI_CODEX_IMAGE_MAX_RESPONSE_BYTES: number;
 /** Maximum error-body size read and discarded: 64 KiB. */
-declare const OPENAI_CODEX_IMAGE_MAX_ERROR_BYTES: number;
+export declare const OPENAI_CODEX_IMAGE_MAX_ERROR_BYTES: number;
 /** Defensive upper bound for unexpected multi-image responses. */
-declare const OPENAI_CODEX_IMAGE_MAX_COUNT = 4;
+export declare const OPENAI_CODEX_IMAGE_MAX_COUNT = 4;
 /** Local prompt limit enforced before any credential or network work. */
-declare const OPENAI_CODEX_IMAGE_PROMPT_MAX_LENGTH = 32000;
+export declare const OPENAI_CODEX_IMAGE_PROMPT_MAX_LENGTH = 32000;
 /** Stable, secret-free transport errors consumed structurally by companion packages. */
-declare const OPENAI_CODEX_TRANSPORT_ERROR_CODES: {
+export declare const OPENAI_CODEX_TRANSPORT_ERROR_CODES: {
   readonly invalidRequest: "OPENAI_CODEX_INVALID_REQUEST";
   readonly signedOut: "OPENAI_CODEX_SIGNED_OUT";
   readonly reauthRequired: "OPENAI_CODEX_REAUTH_REQUIRED";
@@ -166,7 +316,7 @@ declare const OPENAI_CODEX_TRANSPORT_ERROR_CODES: {
 /** Union of the stable transport error codes. */
 type OpenAICodexTransportErrorCode = (typeof OPENAI_CODEX_TRANSPORT_ERROR_CODES)[keyof typeof OPENAI_CODEX_TRANSPORT_ERROR_CODES];
 /** Fixed, secret-free transport failure. */
-declare class OpenAICodexTransportError extends Error {
+export declare class OpenAICodexTransportError extends Error {
   readonly code: OpenAICodexTransportErrorCode;
   readonly status?: number;
   readonly retryAfterSeconds?: number;
@@ -176,7 +326,7 @@ declare class OpenAICodexTransportError extends Error {
   });
 }
 /** Identify transport failures structurally without relying on cross-package class identity. */
-declare function isOpenAICodexTransportError(error: unknown): error is OpenAICodexTransportError;
+export declare function isOpenAICodexTransportError(error: unknown): error is OpenAICodexTransportError;
 /** Only caller-controlled field accepted by the Host transport. */
 interface ImageGenerationRequest {
   readonly prompt: string;
@@ -201,36 +351,45 @@ interface ImageGenerationResponse {
 interface OpenAICodexTransportV1 {
   readonly apiVersion: 1;
   generateImages(input: ImageGenerationRequest, context: ImageRequestContext): Promise<ImageGenerationResponse>;
+  /** Additive capability: an older v1 service may not support editing. Never fall back. */
+  editImages?(input: ImageEditRequest, context: ImageRequestContext): Promise<ImageGenerationResponse>;
 }
 /** Core-owned Cordis service for the optional image package. */
-declare class OpenAICodexTransport extends Service implements OpenAICodexTransportV1 {
+export declare class OpenAICodexTransport extends Service implements OpenAICodexTransportV1 {
   private readonly credentials;
   private readonly proxyManager?;
   private readonly resolveProxyUrl;
+  private readonly resolveImageModelHint;
+  private readonly backendRequests?;
   readonly apiVersion: 1;
-  constructor(ctx: Context, credentials: OpenAICodexCredentialStore, proxyManager?: OpenAICodexProxyManager | undefined, resolveProxyUrl?: () => string | undefined);
+  constructor(ctx: Context, credentials: OpenAICodexCredentialStore, proxyManager?: OpenAICodexProxyManager | undefined, resolveProxyUrl?: () => string | undefined, resolveImageModelHint?: () => string, backendRequests?: OpenAICodexBackendRequests | undefined);
   generateImages(input: ImageGenerationRequest, context: ImageRequestContext): Promise<ImageGenerationResponse>;
+  editImages(input: ImageEditRequest, context: ImageRequestContext): Promise<ImageGenerationResponse>;
+  private requestImages;
   private generateImagesWithoutProxy;
 }
 //#endregion
 //#region src/view-image.d.ts
 /** Stable Codex tool name. */
-declare const VIEW_IMAGE_TOOL_NAME = "view_image";
+export declare const VIEW_IMAGE_TOOL_NAME = "view_image";
 //#endregion
 //#region src/image-tool.d.ts
 /** Stable model-callable tool name. */
-declare const IMAGE_GENERATE_TOOL_NAME = "codex_connect_image_generate";
+export declare const IMAGE_GENERATE_TOOL_NAME = "codex_connect_image_generate";
 //#endregion
 //#region src/compatibility.d.ts
-declare const COMPATIBILITY_SCHEMA_VERSION: 1;
-declare const SUPPORTED_NODE_RANGE = "^22.19.0 || >=24.0.0";
-declare const SUPPORTED_DSH_PLUGIN_API_VERSION = "0.1.2-rc.1";
-declare const SUPPORTED_PI_AI_RANGE = "^0.84.2";
-declare const PI_AI_PACKAGE = "@earendil-works/pi-ai";
-declare const DSH_PLUGIN_API_PACKAGES: readonly ["@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-atomic-write", "@deepseek-ai/dsh-attachment", "@deepseek-ai/dsh-home-paths", "@deepseek-ai/dsh-host-webserver", "@deepseek-ai/dsh-invariants", "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-fs", "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-util-values", "@deepseek-ai/dsh-web"];
-declare const COMPATIBILITY_PACKAGES: readonly ["@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@earendil-works/pi-ai"];
+export declare const COMPATIBILITY_SCHEMA_VERSION: 1;
+export declare const SUPPORTED_NODE_RANGE = "^22.19.0 || >=24.0.0";
+export declare const SUPPORTED_DSH_PLUGIN_API_VERSION = "0.1.7-rc.1";
+export declare const SUPPORTED_DSH_PLUGIN_API_VERSIONS: readonly ["0.1.7-rc.1", "0.1.7-rc.2", "0.2.0-rc.1", "0.2.0-rc.2", "0.2.1-alpha.1"];
+export declare const SUPPORTED_DSH_PLUGIN_API_RANGE: string;
+export declare const SUPPORTED_PI_AI_RANGE = "0.85.1";
+export declare const PI_AI_PACKAGE = "@earendil-works/pi-ai";
+export declare const DSH_PLUGIN_API_PACKAGES: readonly ["@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-atomic-write", "@deepseek-ai/dsh-attachment", "@deepseek-ai/dsh-client-ui-chat", "@deepseek-ai/dsh-client-ui-layout", "@deepseek-ai/dsh-client-ui-primitives", "@deepseek-ai/dsh-client-ui-tool", "@deepseek-ai/dsh-compaction", "@deepseek-ai/dsh-home-paths", "@deepseek-ai/dsh-host-webserver", "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-fs", "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-util-values", "@deepseek-ai/dsh-web"];
+export declare const COMPATIBILITY_PACKAGES: readonly ["@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-compaction", "@earendil-works/pi-ai"];
 type CompatibilityPackageName = (typeof COMPATIBILITY_PACKAGES)[number];
-type CompatibilityStatus = 'compatible' | 'incompatible' | 'unknown';
+/** Version metadata proves a declared match, not behavioral failure for an untested package. */
+type CompatibilityStatus = 'compatible' | 'unverified' | 'incompatible' | 'unknown';
 interface CompatibilityEntry {
   supported: string;
   installed: string | null;
@@ -260,28 +419,31 @@ interface CompatibilityEvaluationInput {
 interface CompatibilityDetectionOptions extends CompatibilityEvaluationInput {
   /** Test seam for package metadata resolution; no package paths are returned. */
   readPackageVersion?: (name: CompatibilityPackageName) => string | null | undefined | Promise<string | null | undefined>;
+  /** Explicit package.json of the DSH installation owning a standalone CLI invocation. */
+  installAnchor?: string;
 }
 /** Public contract data mirrored by compatibility.json without importing JSON at runtime. */
-declare const COMPATIBILITY_CONTRACT: {
+export declare const COMPATIBILITY_CONTRACT: {
   readonly schemaVersion: 1;
   readonly engines: {
     readonly node: "^22.19.0 || >=24.0.0";
   };
   readonly dshPluginApi: {
-    readonly version: "0.1.2-rc.1";
-    readonly packages: readonly ["@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-atomic-write", "@deepseek-ai/dsh-attachment", "@deepseek-ai/dsh-home-paths", "@deepseek-ai/dsh-host-webserver", "@deepseek-ai/dsh-invariants", "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-fs", "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-util-values", "@deepseek-ai/dsh-web"];
+    readonly version: "0.1.7-rc.1";
+    readonly versions: readonly ["0.1.7-rc.1", "0.1.7-rc.2", "0.2.0-rc.1", "0.2.0-rc.2", "0.2.1-alpha.1"];
+    readonly packages: readonly ["@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-atomic-write", "@deepseek-ai/dsh-attachment", "@deepseek-ai/dsh-client-ui-chat", "@deepseek-ai/dsh-client-ui-layout", "@deepseek-ai/dsh-client-ui-primitives", "@deepseek-ai/dsh-client-ui-tool", "@deepseek-ai/dsh-compaction", "@deepseek-ai/dsh-home-paths", "@deepseek-ai/dsh-host-webserver", "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-fs", "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-util-values", "@deepseek-ai/dsh-web"];
   };
   readonly piAi: {
     readonly package: "@earendil-works/pi-ai";
-    readonly version: "^0.84.2";
+    readonly version: "0.85.1";
   };
 };
 /** Evaluate a captured set of versions without touching the filesystem. */
-declare function evaluateCompatibility(input?: CompatibilityEvaluationInput): CompatibilityReport;
+export declare function evaluateCompatibility(input?: CompatibilityEvaluationInput): CompatibilityReport;
 /** Alias for callers that prefer assessment terminology. */
-declare const assessCompatibility: typeof evaluateCompatibility;
+export declare const assessCompatibility: typeof evaluateCompatibility;
 /** Read installed package metadata and return only versions and statuses. */
-declare function detectCompatibility(options?: CompatibilityDetectionOptions): Promise<CompatibilityReport>;
+export declare function detectCompatibility(options?: CompatibilityDetectionOptions): Promise<CompatibilityReport>;
 //#endregion
 //#region src/doctor.d.ts
 /** Inputs that are safe to obtain without booting OAuth. */
@@ -321,18 +483,18 @@ interface OpenAICodexDiagnosticReport {
   hints: string[];
 }
 /** Actionable message for legacy/manual `openai-codex` adapter collisions. */
-declare function openAICodexConflictMessage(): string;
+export declare function openAICodexConflictMessage(): string;
 /** Fail before the generic registry error so the collision has a migration hint. */
-declare function assertNoOpenAICodexProviderConflict(providerIds: readonly string[]): void;
+export declare function assertNoOpenAICodexProviderConflict(providerIds: readonly string[]): void;
 /**
  * Inspect only process and filesystem metadata. This function never opens the
  * OAuth document, refreshes a token, or starts an authorization flow.
  */
-declare function diagnoseOpenAICodex(options?: OpenAICodexDiagnosticOptions): Promise<OpenAICodexDiagnosticReport>;
+export declare function diagnoseOpenAICodex(options?: OpenAICodexDiagnosticOptions): Promise<OpenAICodexDiagnosticReport>;
 //#endregion
 //#region src/usage.d.ts
 /** Fixed endpoint used by the official Codex client for ChatGPT rate limits. */
-declare const OPENAI_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+export declare const OPENAI_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 /** One quota window expressed as remaining capacity for direct UI rendering. */
 interface OpenAICodexRateLimitWindow {
   /** Percent still available in this window. */
@@ -383,23 +545,27 @@ interface OpenAICodexUsage {
  * @param value - opaque JSON returned by the ChatGPT usage endpoint.
  * @returns core and additionally metered quota buckets with remaining percentages.
  */
-declare function parseOpenAICodexUsage(value: unknown): OpenAICodexUsage;
+export declare function parseOpenAICodexUsage(value: unknown): OpenAICodexUsage;
 /**
  * Read current quota without issuing a model request. OAuth is refreshed through
  * the same provider-native credential lifecycle used by normal Codex turns.
  * @param store - plugin-owned OAuth credential store.
  * @returns current rate-limit buckets safe to expose to the local browser page.
  */
-declare function readOpenAICodexRateLimits(store: Pick<OpenAICodexCredentialStore, 'captureActiveAccount'>): Promise<OpenAICodexUsage>;
+export declare function readOpenAICodexRateLimits(store: Pick<OpenAICodexCredentialStore, 'captureActiveAccount'>): Promise<OpenAICodexUsage>;
 //#endregion
 //#region src/settings-contract.d.ts
 /** Node-free settings contract shared by the Host plugin and browser card. */
 /** Stable Harness settings namespace owned by this plugin. */
-declare const OPENAI_CODEX_SETTINGS_NAMESPACE = "llm-openai-codex";
+export declare const OPENAI_CODEX_SETTINGS_NAMESPACE = "llm-openai-codex";
 /** Suggested local HTTP proxy shown by the settings UI; it is never enabled by default. */
-declare const DEFAULT_OPENAI_CODEX_PROXY_URL = "http://127.0.0.1:7890";
+export declare const DEFAULT_OPENAI_CODEX_PROXY_URL = "http://127.0.0.1:7890";
+/** Empty profile setting, which makes image requests use the default route hint. */
+export declare const DEFAULT_OPENAI_CODEX_IMAGE_MODEL_HINT = "";
+/** Validate an optional bounded ASCII image route model hint. */
+export declare function isValidOpenAICodexImageModelHint(value: unknown): value is string;
 /** Whether a value is a supported, canonical HTTP(S) proxy origin. */
-declare function isValidOpenAICodexProxyUrl(value: unknown): value is string;
+export declare function isValidOpenAICodexProxyUrl(value: unknown): value is string;
 /** Search modes accepted by the Codex standalone search endpoint. */
 type OpenAICodexSearchMode = 'cached' | 'indexed' | 'live';
 /** Search-context sizes accepted by the Codex standalone search endpoint. */
@@ -410,15 +576,15 @@ type OpenAICodexSearchContextSize = 'low' | 'medium' | 'high';
  * to restore that model's catalog default. The Host also checks catalog
  * membership and the model-specific configuration ceiling.
  */
-declare function isValidOpenAICodexContextWindowOverrides(value: unknown): value is Readonly<Record<string, number | null>>;
+export declare function isValidOpenAICodexContextWindowOverrides(value: unknown): value is Readonly<Record<string, number | null>>;
 /** Default model used by the standalone search endpoint. */
-declare const DEFAULT_OPENAI_CODEX_SEARCH_MODEL = "gpt-5.6-sol";
+export declare const DEFAULT_OPENAI_CODEX_SEARCH_MODEL = "gpt-5.6-sol";
 /** Default search mode, matching the official local Codex client. */
-declare const DEFAULT_OPENAI_CODEX_SEARCH_MODE: OpenAICodexSearchMode;
+export declare const DEFAULT_OPENAI_CODEX_SEARCH_MODE: OpenAICodexSearchMode;
 /** Default provider search-context size. */
-declare const DEFAULT_OPENAI_CODEX_SEARCH_CONTEXT_SIZE: OpenAICodexSearchContextSize;
+export declare const DEFAULT_OPENAI_CODEX_SEARCH_CONTEXT_SIZE: OpenAICodexSearchContextSize;
 /** Default output budget for the standalone search response. */
-declare const DEFAULT_OPENAI_CODEX_SEARCH_MAX_OUTPUT_TOKENS = 10000;
+export declare const DEFAULT_OPENAI_CODEX_SEARCH_MAX_OUTPUT_TOKENS = 10000;
 /** Fully resolved user-editable section presented by Plugin configuration. */
 interface OpenAICodexSettingsConfig {
   /** Model ids advertised in selectors; undefined advertises the full catalog. */
@@ -435,8 +601,18 @@ interface OpenAICodexSettingsConfig {
    */
   contextWindowOverrides: Readonly<Record<string, number>> | undefined;
   enableSearch: boolean;
+  /** Follow explicit server-authorized Luna Reserve transitions for agent requests. */
+  enableReserveFallback: boolean;
+  /** Default Fast Mode for newly started top-level sessions; existing sessions are unchanged. */
+  enableNewSessionFastMode: boolean;
+  /** Independent default for newly started subagent sessions. */
+  enableNewSubagentFastMode: boolean;
+  /** Use provider-native Responses V2 compaction when DSH requests compaction. */
+  enableNativeCompaction: boolean;
   enableImageTool: boolean;
   enableImageGeneration: boolean;
+  /** Optional profile-scoped model hint for image generation; empty uses the route default. */
+  imageModelHint: string;
   /** Whether this profile accepted the Auto-review data disclosure. */
   autoReviewDisclosureAcknowledged: boolean;
   /** Let the hidden Codex reviewer answer eligible DSH approval requests. */
@@ -446,25 +622,25 @@ interface OpenAICodexSettingsConfig {
   searchContextSize: OpenAICodexSearchContextSize;
   searchMaxOutputTokens: number;
 }
-declare const DEFAULT_OPENAI_CODEX_SETTINGS: Readonly<OpenAICodexSettingsConfig>;
+export declare const DEFAULT_OPENAI_CODEX_SETTINGS: Readonly<OpenAICodexSettingsConfig>;
 /** Input settings allow null to disable overrides inherited from a lower settings layer. */
 interface OpenAICodexSettingsInput extends Partial<Omit<OpenAICodexSettingsConfig, 'contextWindowOverrides'>> {
   contextWindowOverrides?: Readonly<Record<string, number | null>> | null | undefined;
 }
 /** Fill the schema defaults even when called without Cordis validation. */
-declare function resolveOpenAICodexSettings(value: OpenAICodexSettingsInput): OpenAICodexSettingsConfig;
+export declare function resolveOpenAICodexSettings(value: OpenAICodexSettingsInput): OpenAICodexSettingsConfig;
 /** Resolve the active proxy without treating a disabled value as a route. */
-declare function resolveOpenAICodexProxyUrl(value: OpenAICodexSettingsInput): string | undefined;
+export declare function resolveOpenAICodexProxyUrl(value: OpenAICodexSettingsInput): string | undefined;
 /** Narrow the redacted settings wire payload before it enters React state. */
-declare function decodeOpenAICodexSettings(value: unknown): OpenAICodexSettingsConfig | undefined;
+export declare function decodeOpenAICodexSettings(value: unknown): OpenAICodexSettingsConfig | undefined;
 //#endregion
 //#region src/search.d.ts
 /** Stable dsh web-provider id selected by the bundle patch. */
-declare const OPENAI_CODEX_SEARCH_PROVIDER = "openai-codex";
+export declare const OPENAI_CODEX_SEARCH_PROVIDER = "openai-codex";
 /** Trusted first-party Codex base; OAuth credentials never cross to a configured origin. */
-declare const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
+export declare const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 /** Standalone search endpoint used by the official Codex client. */
-declare const OPENAI_CODEX_SEARCH_URL = "https://chatgpt.com/backend-api/codex/alpha/search";
+export declare const OPENAI_CODEX_SEARCH_URL = "https://chatgpt.com/backend-api/codex/alpha/search";
 interface SearchRequestBody {
   readonly id: string;
   readonly model: string;
@@ -513,6 +689,8 @@ interface OpenAICodexSearchProviderOptions {
   readonly proxyManager?: OpenAICodexProxyManager;
   /** Resolve the active proxy for each search request. */
   readonly resolveProxyUrl?: () => string | undefined;
+  /** Shared runtime request governor; preferred over the legacy proxy-only path. */
+  readonly backendRequests?: OpenAICodexBackendRequests;
   /** Record the exact secret-free request before dispatch. */
   readonly recordRequest?: (request: OpenAICodexSearchRequestRecord) => void;
 }
@@ -523,9 +701,9 @@ interface OpenAICodexSearchProviderOptions {
  * @param value - parsed response JSON.
  * @returns normalized answer and citeable sources.
  */
-declare function mapOpenAICodexSearchResponse(value: unknown): WebSearchResult;
+export declare function mapOpenAICodexSearchResponse(value: unknown): WebSearchResult;
 /** OpenAI Codex standalone-search provider using the same refreshable OAuth store as the LLM route. */
-declare class OpenAICodexSearchProvider implements WebSearchProvider {
+export declare class OpenAICodexSearchProvider implements WebSearchProvider {
   private readonly options;
   readonly id = "openai-codex";
   /**
@@ -542,9 +720,9 @@ declare class OpenAICodexSearchProvider implements WebSearchProvider {
 //#region src/proxy-paths.d.ts
 /** Node-free route constants shared by the Host and browser plugin halves. */
 /** Detect bounded local/environment proxy candidates without changing settings. */
-declare const OPENAI_CODEX_PROXY_DETECT_PATH = "/plugins/dsh-openai-codex/proxy/detect";
+export declare const OPENAI_CODEX_PROXY_DETECT_PATH = "/plugins/dsh-openai-codex/proxy/detect";
 /** Test one manually entered proxy origin without changing settings. */
-declare const OPENAI_CODEX_PROXY_TEST_PATH = "/plugins/dsh-openai-codex/proxy/test";
+export declare const OPENAI_CODEX_PROXY_TEST_PATH = "/plugins/dsh-openai-codex/proxy/test";
 //#endregion
 //#region src/auth.d.ts
 /** Non-secret login state shown by the launcher. */
@@ -559,38 +737,38 @@ interface OpenAICodexAuthStatus {
  * @param interaction - terminal or UI callbacks for the provider flow.
  * @param store - credential store, defaulting under `$DSH_HOME`.
  */
-declare function loginOpenAICodex(interaction: AuthInteraction, store?: OpenAICodexCredentialStore): Promise<void>;
+export declare function loginOpenAICodex(interaction: AuthInteraction, store?: OpenAICodexCredentialStore): Promise<void>;
 /**
  * Remove the stored OpenAI Codex credential.
  * @param store - credential store, defaulting under `$DSH_HOME`.
  */
-declare function logoutOpenAICodex(store?: OpenAICodexCredentialStore): Promise<void>;
+export declare function logoutOpenAICodex(store?: OpenAICodexCredentialStore): Promise<void>;
 /**
  * Read non-secret OpenAI Codex login state without refreshing the token.
  * @param store - credential store, defaulting under `$DSH_HOME`.
  * @returns stored login state and expiry.
  */
-declare function openAICodexAuthStatus(store?: CredentialStore): Promise<OpenAICodexAuthStatus>;
+export declare function openAICodexAuthStatus(store?: CredentialStore): Promise<OpenAICodexAuthStatus>;
 //#endregion
 //#region src/fast-mode.d.ts
 /** Process-local, per-session OpenAI Codex Fast Mode state. */
 /** Maximum number of enabled sessions retained by one plugin instance. */
-declare const OPENAI_CODEX_FAST_MODE_MAX_SESSIONS = 256;
+export declare const OPENAI_CODEX_FAST_MODE_MAX_SESSIONS = 256;
 /** Maximum UTF-16 code units accepted for an opaque DSH session id. */
-declare const OPENAI_CODEX_FAST_MODE_MAX_SESSION_ID_LENGTH = 256;
+export declare const OPENAI_CODEX_FAST_MODE_MAX_SESSION_ID_LENGTH = 256;
 /**
  * Validate the opaque session identity used by the Fast Mode registry.
  *
  * The registry deliberately does not interpret or normalize session ids.  It
  * only rejects values that cannot safely serve as a bounded map key.
  */
-declare function isFastModeSessionId(value: unknown): value is string;
+export declare function isFastModeSessionId(value: unknown): value is string;
 /**
  * In-memory Fast Mode registry.  Entries are positive-only: disabling a
  * session removes its key, and an insertion over the bound evicts the least
  * recently touched key.  A new plugin instance starts with an empty map.
  */
-declare class FastModeRegistry {
+export declare class FastModeRegistry {
   private readonly maxSessions;
   private readonly enabledSessions;
   constructor(maxSessions?: number);
@@ -613,36 +791,25 @@ declare class FastModeRegistry {
 //#region src/fast-mode-paths.d.ts
 /** Node-free Fast Mode route constants shared by Host and browser halves. */
 /** GET/POST endpoint for one conversation's process-local Fast Mode state. */
-declare const OPENAI_CODEX_FAST_MODE_PATH = "/plugins/dsh-openai-codex/fast-mode";
+export declare const OPENAI_CODEX_FAST_MODE_PATH = "/plugins/dsh-openai-codex/fast-mode";
 //#endregion
 //#region src/update-paths.d.ts
 /** Same-origin route used by the browser update reminder. */
-declare const OPENAI_CODEX_UPDATE_PATH = "/openai-codex/update";
+export declare const OPENAI_CODEX_UPDATE_PATH = "/openai-codex/update";
 //#endregion
 //#region src/update.d.ts
-type OpenAICodexUpdateHighlightKind = 'trusted-origins' | 'runtime-compatibility' | 'quota-fast-mode' | 'dsh-rc7' | 'search-stability' | 'image-generation' | 'oauth-history' | 'model-visibility' | 'proxy-connection' | 'models-account' | 'context-budget' | 'auto-review-probe' | 'auto-review' | 'astra-compatibility' | 'multi-account' | 'search-route';
+type OpenAICodexUpdateHighlightKind = 'trusted-origins' | 'runtime-compatibility' | 'quota-fast-mode' | 'dsh-rc7' | 'search-stability' | 'image-generation' | 'oauth-history' | 'model-visibility' | 'proxy-connection' | 'models-account' | 'context-budget' | 'auto-review-probe' | 'auto-review' | 'astra-compatibility' | 'multi-account' | 'search-route' | 'image-model-hint' | 'luna-reserve';
 interface OpenAICodexUpdateHighlight {
   version: string;
   kind: OpenAICodexUpdateHighlightKind;
 }
-type OpenAICodexDshCompatibilityStatus = 'compatible' | 'plugin-update-required' | 'dsh-update-required' | 'not-yet-compatible' | 'unverified';
-interface OpenAICodexDshCompatibilityAdvice {
-  status: OpenAICodexDshCompatibilityStatus;
-  latestPluginVersion: string;
-  latestDshVersion?: string;
-  reportCompatibilityGap?: true;
-  trackerUrl?: string;
-}
 type OpenAICodexUpdateResult = {
   status: 'up-to-date';
   currentVersion: string;
-  currentDshVersion?: string;
   latestVersion: string;
-  compatibility: OpenAICodexDshCompatibilityAdvice;
 } | {
   status: 'update-available';
   currentVersion: string;
-  currentDshVersion?: string;
   latestVersion: string;
   releaseUrl: string;
   highlights: OpenAICodexUpdateHighlight[];
@@ -650,11 +817,9 @@ type OpenAICodexUpdateResult = {
   releaseName?: string;
   releaseNotes?: string;
   publishedAt?: string;
-  compatibility: OpenAICodexDshCompatibilityAdvice;
 } | {
   status: 'unavailable';
   currentVersion: string;
-  currentDshVersion?: string;
   reason: 'invalid-current-version' | 'registry-unavailable' | 'invalid-registry-response';
 };
 interface ParsedVersion {
@@ -665,26 +830,25 @@ interface ParsedVersion {
 }
 interface UpdateCheckOptions {
   currentVersion: string;
-  currentDshVersion?: string;
   fetchImpl?: FetchImpl;
   timeoutMs?: number;
 }
 type FetchImpl = (input: string, init?: RequestInit) => Promise<Response>;
 /** Parse one exact package version, accepting the conventional leading `v`. */
-declare function parseOpenAICodexVersion(raw: string): ParsedVersion | undefined;
+export declare function parseOpenAICodexVersion(raw: string): ParsedVersion | undefined;
 /** Compare two package versions using SemVer precedence (build metadata ignored). */
-declare function compareOpenAICodexVersions(left: string, right: string): number;
+export declare function compareOpenAICodexVersions(left: string, right: string): number;
 /** Check npm's public dist-tags and enrich an available update with public release notes. */
-declare function checkForOpenAICodexUpdate(options: UpdateCheckOptions): Promise<OpenAICodexUpdateResult>;
+export declare function checkForOpenAICodexUpdate(options: UpdateCheckOptions): Promise<OpenAICodexUpdateResult>;
 /** Validate a route response before it is rendered by the browser. */
-declare function parseOpenAICodexUpdateResult(value: unknown): OpenAICodexUpdateResult | undefined;
+export declare function parseOpenAICodexUpdateResult(value: unknown): OpenAICodexUpdateResult | undefined;
 //#endregion
 //#region src/history-migration.d.ts
 /** Offline compatibility migration for the private Codex search event emitted by Alpha 4.10. */
 /** Private event written by Alpha 4.10 before the provider stopped persisting it. */
-declare const OPENAI_CODEX_SEARCH_MODEL_REQUEST_EVENT = "web/openai-codex-search-llm-request";
+export declare const OPENAI_CODEX_SEARCH_MODEL_REQUEST_EVENT = "web/openai-codex-search-llm-request";
 /** Backup suffix created beside every changed session artifact. */
-declare const OPENAI_CODEX_HISTORY_BACKUP_SUFFIX = ".pre-codex-search-history-migration";
+export declare const OPENAI_CODEX_HISTORY_BACKUP_SUFFIX = ".pre-codex-search-history-migration";
 interface OpenAICodexHistoryMigrationOptions {
   /** Apply changes; omitted/false performs a read-only dry run. */
   readonly apply?: boolean;
@@ -712,7 +876,7 @@ interface OpenAICodexHistoryMigrationResult {
  * Applying is an offline maintenance operation and fails closed without the
  * caller's explicit acknowledgement that all DSH writers are stopped.
  */
-declare function migrateOpenAICodexSearchHistory(options?: OpenAICodexHistoryMigrationOptions): Promise<OpenAICodexHistoryMigrationResult>;
+export declare function migrateOpenAICodexSearchHistory(options?: OpenAICodexHistoryMigrationOptions): Promise<OpenAICodexHistoryMigrationResult>;
 //#endregion
 //#region src/index.d.ts
 declare module '@deepseek-ai/cordis' {
@@ -722,13 +886,17 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 /** Stable Cordis plugin name. */
-declare const name = "llm-openai-codex";
+export declare const name = "llm-openai-codex";
 /** The model registry required before the provider can register. */
-declare const inject: string[];
+export declare const inject: string[];
 /** Branded Host settings namespace for Codex Connect capability configuration. */
-declare const OPENAI_CODEX_SETTINGS_NS = "llm-openai-codex";
-/** Composite model and standalone-search configuration. */
-interface Config {
+export declare const OPENAI_CODEX_SETTINGS_NS = "llm-openai-codex";
+/** Plain configuration accepted by direct Cordis composition and unit tests. */
+export interface Config {
+  /** Opt-in absolute owner-only directory for local request evidence; never uploads telemetry. Restart to change. */
+  requestMetricsDirectory?: string | undefined;
+  /** Per-process journal limit; reaching it stops recording with a warning, not model execution. */
+  requestMetricsMaxBytes?: number;
   /** Complete interactive OAuth deadline in milliseconds; applies when the plugin loads. */
   oauthTimeoutMs?: number;
   /** Model ids advertised in selectors; omitted to advertise the full catalog. */
@@ -747,10 +915,22 @@ interface Config {
   contextWindowOverrides?: Record<string, number | null> | null | undefined;
   /** Register the optional standalone Codex search provider. */
   enableSearch?: boolean;
+  /** Automatically follow server-authorized Luna Reserve transitions, never generic rate limits. */
+  enableReserveFallback?: boolean;
+  /** Enable Fast Mode for newly started top-level sessions only. */
+  enableNewSessionFastMode?: boolean;
+  /** Independent opt-in default for newly started subagent sessions. */
+  enableNewSubagentFastMode?: boolean;
+  /** Explicit profile opt-in to Codex native context management; DSH owns automatic triggers. Disabling stops new native compactions, not replay of existing checkpoints. */
+  enableNativeCompaction?: boolean;
   /** Register the optional image-loading tool. */
   enableImageTool?: boolean;
   /** Register the optional prompt-only image generation tool. */
   enableImageGeneration?: boolean;
+  /** Restrict the image handle bridge to these tool names; omitted processes every tool. */
+  imageHandleBridgeTools?: string[] | undefined;
+  /** Optional profile-scoped image route model hint; empty uses the default route hint. */
+  imageModelHint?: string;
   /** Record that this profile accepted the Auto-review data disclosure. */
   autoReviewDisclosureAcknowledged?: boolean;
   /** Let the hidden Codex reviewer answer eligible DSH approval requests. */
@@ -764,7 +944,32 @@ interface Config {
   /** Maximum generated tokens returned by the standalone search endpoint. */
   searchMaxOutputTokens?: number;
 }
-declare const Config: z<Config>;
+/** Runtime configuration exposes each editable field through Cordis's public Volatile type. */
+export interface VolatileConfig {
+  requestMetricsDirectory?: string | undefined;
+  requestMetricsMaxBytes: number;
+  oauthTimeoutMs: number;
+  models: Volatile<string[] | undefined>;
+  enableProxy: Volatile<boolean>;
+  proxyUrl: Volatile<string>;
+  contextWindowOverrides: Volatile<Record<string, number | null> | null | undefined>;
+  enableSearch: Volatile<boolean>;
+  enableReserveFallback: Volatile<boolean>;
+  enableNewSessionFastMode: Volatile<boolean>;
+  enableNewSubagentFastMode: Volatile<boolean>;
+  enableNativeCompaction: Volatile<boolean>;
+  enableImageTool: Volatile<boolean>;
+  enableImageGeneration: Volatile<boolean>;
+  imageHandleBridgeTools: Volatile<string[] | undefined>;
+  imageModelHint: Volatile<string>;
+  autoReviewDisclosureAcknowledged: Volatile<boolean>;
+  enableAutoReview: Volatile<boolean>;
+  searchModel: Volatile<string>;
+  searchMode: Volatile<OpenAICodexSearchMode>;
+  searchContextSize: Volatile<OpenAICodexSearchContextSize>;
+  searchMaxOutputTokens: Volatile<number>;
+}
+export declare const Config: z<Config, VolatileConfig>;
 /**
  * Register the `openai-codex` LLM route with one provider-native OAuth store.
  * Search and image tooling are added only when their config flags are true.
@@ -772,6 +977,6 @@ declare const Config: z<Config>;
  * @param ctx - plugin context carrying the LLM registry plus optional services.
  * @param config - capability gates and standalone-search tuning.
  */
-declare function apply(ctx: Context, config: Config): void;
+export declare function apply(ctx: Context, config: Config | VolatileConfig): void;
 //#endregion
-export { COMPATIBILITY_CONTRACT, COMPATIBILITY_PACKAGES, COMPATIBILITY_SCHEMA_VERSION, type CompatibilityDetectionOptions, type CompatibilityEntry, type CompatibilityEvaluationInput, type CompatibilityPackageName, type CompatibilityReport, type CompatibilityStatus, Config, DEFAULT_OPENAI_CODEX_PROXY_URL, DEFAULT_OPENAI_CODEX_SEARCH_CONTEXT_SIZE, DEFAULT_OPENAI_CODEX_SEARCH_MAX_OUTPUT_TOKENS, DEFAULT_OPENAI_CODEX_SEARCH_MODE, DEFAULT_OPENAI_CODEX_SEARCH_MODEL, DEFAULT_OPENAI_CODEX_SETTINGS, DSH_PLUGIN_API_PACKAGES, FastModeRegistry, FastModeRegistry as OpenAICodexFastModeRegistry, type GeneratedImagePayload, IMAGE_GENERATE_TOOL_NAME, type ImageGenerationRequest, type ImageGenerationResponse, type ImageRequestContext, OPENAI_CODEX_ACCOUNT_LIMIT, OPENAI_CODEX_AUTH_DOCUMENT_LIMIT, OPENAI_CODEX_AUTH_FILENAME, OPENAI_CODEX_AUTH_V1_BACKUP_SUFFIX, OPENAI_CODEX_BASE_URL, OPENAI_CODEX_FAST_MODE_MAX_SESSIONS, OPENAI_CODEX_FAST_MODE_MAX_SESSION_ID_LENGTH, OPENAI_CODEX_FAST_MODE_PATH, OPENAI_CODEX_HISTORY_BACKUP_SUFFIX, OPENAI_CODEX_IMAGE_GENERATION_URL, OPENAI_CODEX_IMAGE_MAX_COUNT, OPENAI_CODEX_IMAGE_MAX_ERROR_BYTES, OPENAI_CODEX_IMAGE_MAX_RESPONSE_BYTES, OPENAI_CODEX_IMAGE_PROMPT_MAX_LENGTH, OPENAI_CODEX_IMAGE_REQUEST_TIMEOUT_MS, OPENAI_CODEX_LOCAL_PROXY_CANDIDATES, OPENAI_CODEX_PROVIDER, OPENAI_CODEX_PROXY_CANDIDATE_LIMIT, OPENAI_CODEX_PROXY_DETECT_PATH, OPENAI_CODEX_PROXY_PROBE_TIMEOUT_MS, OPENAI_CODEX_PROXY_PROBE_URL, OPENAI_CODEX_PROXY_TEST_PATH, OPENAI_CODEX_SEARCH_MODEL_REQUEST_EVENT, OPENAI_CODEX_SEARCH_PROVIDER, OPENAI_CODEX_SEARCH_URL, OPENAI_CODEX_SETTINGS_NAMESPACE, OPENAI_CODEX_SETTINGS_NS, OPENAI_CODEX_TRANSPORT_API_VERSION, OPENAI_CODEX_TRANSPORT_ERROR_CODES, OPENAI_CODEX_TRANSPORT_SERVICE, OPENAI_CODEX_UPDATE_PATH, OPENAI_CODEX_USAGE_URL, type OpenAICodexAccountSummary, type OpenAICodexAuthStatus, OpenAICodexCredentialStore, type OpenAICodexCredits, type OpenAICodexDiagnosticOptions, type OpenAICodexDiagnosticReport, type OpenAICodexHistoryMigrationFile, type OpenAICodexHistoryMigrationOptions, type OpenAICodexHistoryMigrationResult, type OpenAICodexIndividualLimit, OpenAICodexProxyManager, type OpenAICodexProxyProbeClassification, type OpenAICodexProxyProbeResult, type OpenAICodexRateLimit, type OpenAICodexRateLimitWindow, type OpenAICodexSearchContextSize, type OpenAICodexSearchMode, OpenAICodexSearchProvider, type OpenAICodexSearchProviderOptions, type OpenAICodexSearchRequestRecord, type OpenAICodexSettingsConfig, OpenAICodexTransport, OpenAICodexTransportError, type OpenAICodexTransportErrorCode, type OpenAICodexTransportV1, type OpenAICodexUpdateResult, type OpenAICodexUsage, PI_AI_PACKAGE, SUPPORTED_DSH_PLUGIN_API_VERSION, SUPPORTED_NODE_RANGE, SUPPORTED_PI_AI_RANGE, VIEW_IMAGE_TOOL_NAME, apply, assertNoOpenAICodexProviderConflict, assessCompatibility, checkForOpenAICodexUpdate, compareOpenAICodexVersions, decodeOpenAICodexSettings, detectCompatibility, detectOpenAICodexProxies, diagnoseOpenAICodex, evaluateCompatibility, inject, isFastModeSessionId, isOpenAICodexTransportError, isValidOpenAICodexContextWindowOverrides, isValidOpenAICodexProxyUrl, listOpenAICodexProxyCandidates, loginOpenAICodex, logoutOpenAICodex, mapOpenAICodexSearchResponse, migrateOpenAICodexSearchHistory, name, openAICodexAuthPath, openAICodexAuthStatus, openAICodexConflictMessage, parseOpenAICodexUpdateResult, parseOpenAICodexUsage, parseOpenAICodexVersion, readOpenAICodexRateLimits, resolveOpenAICodexProxyUrl, resolveOpenAICodexSettings };
+export { type CompatibilityDetectionOptions, type CompatibilityEntry, type CompatibilityEvaluationInput, type CompatibilityPackageName, type CompatibilityReport, type CompatibilityStatus, FastModeRegistry as OpenAICodexFastModeRegistry, type GeneratedImagePayload, type ImageGenerationRequest, type ImageGenerationResponse, type ImageRequestContext, type OpenAICodexAccountSummary, type OpenAICodexAuthStatus, type OpenAICodexCredits, type OpenAICodexDiagnosticOptions, type OpenAICodexDiagnosticReport, type OpenAICodexHistoryMigrationFile, type OpenAICodexHistoryMigrationOptions, type OpenAICodexHistoryMigrationResult, type OpenAICodexIndividualLimit, type OpenAICodexProxyProbeClassification, type OpenAICodexProxyProbeResult, type OpenAICodexRateLimit, type OpenAICodexRateLimitWindow, type OpenAICodexSearchContextSize, type OpenAICodexSearchMode, type OpenAICodexSearchProviderOptions, type OpenAICodexSearchRequestRecord, type OpenAICodexSettingsConfig, type OpenAICodexTransportErrorCode, type OpenAICodexTransportV1, type OpenAICodexUpdateResult, type OpenAICodexUsage };

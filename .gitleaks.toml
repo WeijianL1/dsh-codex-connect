@@ -1,0 +1,11 @@
+# Preserve default credential detection. This evidence map contains source-file
+# SHA-256 hashes, never service keys; allow only these exact file/hash lines.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Source artifact hashes in the issue-271 compatibility evidence"
+condition = "AND"
+paths = ['^docs/experiments/evidence/issue-271-compatibility\.json$']
+regexTarget = "line"
+regexes = ['^\s*"src/auth(?:-routes|-paths|-error)?\.ts":\s*"[a-f0-9]{64}",?\s*$']
