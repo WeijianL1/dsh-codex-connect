@@ -4,6 +4,8 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 import { buildCanaryTrackingIssue } from './canary-tracking.mjs'
+import { validateDshMatrix } from './check-dsh-matrix.mjs'
+import { imageRuntimeService } from './check-installed-images.mjs'
 
 const workflowPath = fileURLToPath(new URL('../.github/workflows/upstream-dsh-canary.yml', import.meta.url))
 const ciWorkflowPath = fileURLToPath(new URL('../.github/workflows/ci.yml', import.meta.url))
@@ -17,6 +19,7 @@ const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'))
 const installCheck = readFileSync(installCheckPath, 'utf8')
 const nextCheck = readFileSync(nextCheckPath, 'utf8')
 const canaryEnvironment = readFileSync(canaryEnvironmentPath, 'utf8')
+const declaredWorkflow = readFileSync(new URL('../.github/workflows/compatibility-canary.yml', import.meta.url), 'utf8')
 
 const failures = []
 let assertionCount = 0
@@ -24,6 +27,62 @@ let assertionCount = 0
 function assertContract(name, condition) {
   assertionCount += 1
   if (!condition) failures.push(name)
+}
+
+assertContract('image fixture selects legacy runtime by declared dependency', imageRuntimeService({ peerDependencies: { '@deepseek-ai/dsh-code-runtime': 'fixture' } }) === 'codeRuntime')
+assertContract('image fixture selects current runtime without a version-prefix assumption', imageRuntimeService({ version: '1.0.0', dependencies: { '@deepseek-ai/dsh-ptc-runtime': 'fixture' } }) === 'ptcRuntime')
+for (const dependencies of [{}, { '@deepseek-ai/dsh-code-runtime': 'fixture', '@deepseek-ai/dsh-ptc-runtime': 'fixture' }]) {
+  let rejected = false
+  try { imageRuntimeService({ dependencies }) } catch { rejected = true }
+  assertContract('image fixture rejects missing or ambiguous runtime identity', rejected)
+}
+
+assertContract('declared canary checks the full same-artifact matrix without a stale version override', /run: pnpm --silent run check:dsh-matrix/u.test(declaredWorkflow) && !/DSH_VERSION:/u.test(declaredWorkflow))
+assertContract('package exposes the declared matrix check', packageJson.scripts?.['check:dsh-matrix'] === 'node scripts/check-dsh-matrix.mjs')
+const matrixVersions = ['0.1.7-rc.1', '0.1.7-rc.2']
+const matrixReports = matrixVersions.map(dshVersion => ({
+  schemaVersion: 1, dshVersion, plugin: 'dsh-codex-connect', pluginVersion: '0.1.0-alpha.4.43',
+  pluginArtifactSha256: 'a'.repeat(64), defaultsUnchanged: true,
+  capabilities: { enableProxy: false, enableSearch: false, enableReserveFallback: false, enableNativeCompaction: false, enableImageTool: false, enableImageGeneration: false, enableAutoReview: false },
+  runtime: { schemaVersion: 1, provider: 'openai-codex', modelCount: 8, reasoningModelCount: 8, preparedModelCount: 8, disposalVerified: true, reserveTransitionsVerified: true,
+    nativeCompactionLifecycle: { syntheticOnly: true, freshProcesses: 10, encodings: ['none', 'zstd'], phases: ['write', 'resume-fork', 'verify-child', 'failure-paths', 'automatic'] },
+    images: { syntheticOnly: true, generated: 2, edited: 2, codeRuns: 2, editSourcesVerified: true, inheritedEditVerified: true, invalidEditRefused: true, selectionHandlesVerified: true, dispatchEvent: 'tool/code-dispatch', originalDownloadVerified: true, inheritedOriginalVerified: true, earlierForkDenied: true, unrelatedSessionDenied: true, realProviderRequests: 0 },
+  },
+}))
+validateDshMatrix(matrixReports, matrixVersions, '0.1.0-alpha.4.43')
+for (const [name, change] of [
+  ['missing host', reports => reports.pop()],
+  ['patched host represented as stock', reports => { reports[0].hostPackageCandidate = { package: '@deepseek-ai/dsh-plugin-manager' } }],
+  ['missing enabled image proof', reports => { delete reports[0].runtime.images }],
+  ['missing fork denial', reports => { reports[0].runtime.images.earlierForkDenied = false }],
+  ['missing edit calls', reports => { delete reports[0].runtime.images.edited }],
+  ['missing edit sources', reports => { delete reports[0].runtime.images.editSourcesVerified }],
+  ['missing inherited edit', reports => { reports[0].runtime.images.inheritedEditVerified = false }],
+  ['missing invalid-edit refusal', reports => { reports[0].runtime.images.invalidEditRefused = false }],
+  ['missing cross-route image handles', reports => { delete reports[0].runtime.images.selectionHandlesVerified }],
+  ['unexpected real image request', reports => { reports[0].runtime.images.realProviderRequests = 1 }],
+  ['invalid package bytes', reports => { reports[0].pluginArtifactSha256 = 'not-a-digest' }],
+  ['wrong host version', reports => { reports[0].dshVersion = '0.1.7-alpha.1' }],
+  ['wrong plugin version', reports => { reports[0].pluginVersion = '0.1.0-alpha.4.42' }],
+  ['failed disposal', reports => { reports[0].runtime.disposalVerified = false }],
+  ['missing Reserve transitions', reports => { delete reports[0].runtime.reserveTransitionsVerified }],
+  ['missing native lifecycle', reports => { delete reports[0].runtime.nativeCompactionLifecycle }],
+  ['in-process-only native lifecycle', reports => { reports[0].runtime.nativeCompactionLifecycle.freshProcesses = 0 }],
+  ['missing native encoding', reports => { reports[0].runtime.nativeCompactionLifecycle.encodings.pop() }],
+  ['missing automatic trigger phase', reports => { reports[0].runtime.nativeCompactionLifecycle.phases.pop() }],
+  ['enabled native default', reports => { reports[0].capabilities.enableNativeCompaction = true }],
+  ['missing native default', reports => { delete reports[0].capabilities.enableNativeCompaction }],
+  ['unprepared model', reports => { reports[0].runtime.preparedModelCount = 7 }],
+  ['missing request preparation', reports => { delete reports[0].runtime.preparedModelCount }],
+  ['changed optional default', reports => { reports[0].capabilities.enableSearch = true }],
+  ['enabled Reserve default', reports => { reports[0].capabilities.enableReserveFallback = true }],
+  ['missing Reserve default', reports => { delete reports[0].capabilities.enableReserveFallback }],
+]) {
+  const reports = structuredClone(matrixReports)
+  change(reports)
+  let rejected = false
+  try { validateDshMatrix(reports, matrixVersions, '0.1.0-alpha.4.43') } catch { rejected = true }
+  assertContract(`declared matrix rejects ${name}`, rejected)
 }
 
 assertContract('workflow runs daily', /^\s+schedule:\s*\n\s+- cron: ["']0 3 \* \* \*["']/m.test(workflow))
@@ -64,8 +123,8 @@ assertContract('candidate failure retries the same shared snapshot once', /steps
 assertContract('candidate tracking runs after successful and failed checks', /Record candidate tracking state[\s\S]*?if: always\(\) && steps\.first-canary\.outcome != 'skipped'/.test(workflow))
 assertContract('candidate tracking reads an optional retry report through the tested helper', /canary-tracking\.mjs[\s\S]*?existsSync\(process\.env\.SECOND_REPORT\)[\s\S]*?buildCanaryTrackingIssue\(first, second/.test(workflow))
 assertContract('issues are deduplicated by candidate version', /listForRepo[\s\S]*?issue\.body\?\.includes\(tracking\.marker\)/.test(workflow))
-assertContract('closed alerts are reopened instead of duplicated', /existing\.state === 'closed'[\s\S]*?state: 'open'/.test(workflow))
-assertContract('unchanged tracker state and title do not rewrite an open issue', /existing\.body\?\.includes\(tracking\.stateMarker\) && existing\.title === tracking\.title[\s\S]*?no update is needed/.test(workflow))
+assertContract('eligible closed alerts are reopened instead of duplicated', /action === 'reopen'[\s\S]*?state: 'open'/.test(workflow))
+assertContract('tracker reconciliation uses evidence and respects not-planned decisions', /canaryTrackerAction\(existing, tracking\)[\s\S]*?action === 'suppressed'[\s\S]*?action === 'unchanged'/.test(workflow))
 assertContract('tracker state changes preserve unrelated labels', /new Set\(existing\.labels[\s\S]*?labels\.delete\('bug'\)[\s\S]*?labels\.delete\('enhancement'\)[\s\S]*?labels\.add\(tracking\.label\)/.test(workflow))
 assertContract('open trackers receive a changed bounded state', /github\.rest\.issues\.update\([\s\S]*?issue_number: existing\.number,[\s\S]*?body: tracking\.body,[\s\S]*?Updated DSH candidate tracker/.test(workflow))
 assertContract('confirmed failure leaves the workflow failed', /Fail after two unsuccessful checks[\s\S]*?run: exit 1/.test(workflow))
@@ -78,8 +137,8 @@ const candidateReport = overrides => ({
   status: 'pass',
   classification: 'candidate-compatible',
   channel: 'alpha',
-  supportedVersion: '0.1.2-rc.1',
-  candidateVersion: '0.1.2-rc.2',
+  supportedVersion: '0.1.7-rc.1',
+  candidateVersion: '0.1.7-alpha.3',
   stage: 'isolated-install',
   nodeVersion: 'v24.15.0',
   pluginCommit: null,
@@ -90,7 +149,7 @@ const passedTracking = buildCanaryTrackingIssue(candidateReport(), undefined, tr
 assertContract(
   'a passing newer candidate becomes a preliminary validation tracker',
   passedTracking?.state === 'passed-needs-full-validation'
-    && passedTracking.marker === '<!-- dsh-canary:0.1.2-rc.2 -->'
+    && passedTracking.marker === '<!-- dsh-canary:0.1.7-alpha.3 -->'
     && passedTracking.label === 'enhancement'
     && passedTracking.body.includes('preliminary evidence only'),
 )
@@ -135,20 +194,20 @@ assertContract('mismatched retry candidates fail closed', (() => {
     return true
   }
 })())
-assertContract('candidate checker opts into the undeclared-version mode', /DSH_UNDECLARED_CANARY_VERSION:\s*'1'/.test(nextCheck))
-assertContract('only candidates that supersede declared support reach isolated installation', /compareSemanticVersions\(candidateVersion, supportedVersion\) > 0[\s\S]*?versionClassification === 'not-newer'[\s\S]*?const candidateCheck/u.test(nextCheck))
+assertContract('only undeclared candidates opt into warning-tolerant validation', /delete checkEnvironment\.DSH_UNDECLARED_CANARY_VERSION[\s\S]*?if \(!declaredSupport\) checkEnvironment\.DSH_UNDECLARED_CANARY_VERSION = '1'/.test(nextCheck))
+assertContract('declared versions and candidates newer than the baseline reach isolated installation', /compareSemanticVersions\(candidateVersion, supportedVersion\) > 0[\s\S]*?versionClassification === 'not-newer'[\s\S]*?const candidateCheck/u.test(nextCheck))
 assertContract('candidate classification is driven by fail-closed exit codes', /classifyCandidateCheckStatus\(candidateCheck\.status\)/.test(nextCheck) && /error instanceof CompatibilityCheckError \? 1 : 2/.test(installCheck))
 assertContract('registry and candidate subprocesses have explicit timeouts', /REGISTRY_TIMEOUT_MS\s*=\s*60 \* 1000[\s\S]*?CANDIDATE_CHECK_TIMEOUT_MS\s*=\s*25 \* 60 \* 1000/.test(nextCheck) && /timeoutMs:\s*COMMAND_TIMEOUT_MS/.test(installCheck))
 assertContract('candidate subprocesses receive a scrubbed environment', /scrubCanaryEnvironment\(process\.env\)/.test(nextCheck) && /allowUndeclaredCanaryVersion[\s\S]*?scrubCanaryEnvironment\(process\.env\)/.test(installCheck))
 assertContract('credential-bearing environment names are filtered', /AUTH\|BEARER\|COOKIE\|CREDENTIAL\|JWT\|KEY\|PASS\|SECRET\|SESSION\|TOKEN/.test(canaryEnvironment))
-assertContract('undeclared candidates install the packed artifact', /allowUndeclaredCanaryVersion[\s\S]*?npm[\s\S]*?'pack'[\s\S]*?pluginSpec = `file:/.test(installCheck))
+assertContract('declared and undeclared checks install a hashed packed artifact', /'pack'[\s\S]*?pluginSpec = `file:[\s\S]*?createHash\('sha256'\)/u.test(installCheck) && !/link:\$\{REPO_ROOT\}/u.test(installCheck))
 assertContract(
   'candidate checks boot the installed model runtime',
   /check-installed-runtime/.test(installCheck) && /installed runtime contract/.test(installCheck),
 )
 assertContract(
   'candidate checks compose the installed profile before plugin commands',
-  /\['web', '--help'\][\s\S]*?installed profile boot[\s\S]*?plugin doctor/u.test(installCheck),
+  /\['web', '--help'\][\s\S]*?installed profile boot[\s\S]*?validateDoctorResult\(doctor[\s\S]*?installed runtime contract/u.test(installCheck),
 )
 assertContract('publishing and deployment commands are absent', !/npm publish|gh release create|\bdeploy\b|3080|3081/iu.test(workflow))
 assertContract(
@@ -160,6 +219,13 @@ assertContract('full check includes the canary workflow contract', /(?:^|&&)\s*p
 // Match a dedicated, required step in validate, not a comment or another job.
 const ciValidateJob = ciWorkflow.match(/^  validate:\s*\n([\s\S]*?)(?=^  \S|(?![\s\S]))/m)?.[1] ?? ''
 const ciValidateSteps = [...ciValidateJob.matchAll(/^      - [\s\S]*?(?=^      - |(?![\s\S]))/gm)]
+assertContract(
+  'PR CI checks every declared host with the same packed artifact',
+  ciValidateSteps.some(([step]) =>
+    /^        run: pnpm --silent run check:dsh-matrix[ \t]*$/m.test(step) &&
+    !step.split('\n').some(line => /^(?:      - |        )(?:if|continue-on-error):/.test(line)),
+  ),
+)
 assertContract(
   'PR CI validate runs the canary workflow contract as a required step',
   !/^    (?:if|continue-on-error):/m.test(ciValidateJob) && ciValidateSteps.some(([step]) =>

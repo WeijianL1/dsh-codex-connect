@@ -1,59 +1,37 @@
 /** OpenAI Codex adapter assembled from public dsh-llm-pi-ai extension points. */
 
-import { createModels, defaultProviderAuthContext } from '@earendil-works/pi-ai'
-import type { Context as PiContext, Model, MutableModels, Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
+import { defaultProviderAuthContext, InMemoryCredentialStore } from '@earendil-works/pi-ai'
+import type { Context as PiContext, Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
+import { codexProviderContext } from './pi-context.ts'
 import { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, GenerateOptions, PreparedAdapterCall, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import type { OpenAICodexCredentialStore } from './store.ts'
+import { readOpenAICodexRequestAuth } from './auth.ts'
 import { OPENAI_CODEX_PROVIDER } from './store.ts'
 import type { FastModeRegistry } from './fast-mode.ts'
 import type { OpenAICodexModelCatalogEntry } from './model-contract.ts'
 import { isValidOpenAICodexContextBudget, openAICodexContextLimit } from './model-contract.ts'
+import { OPENAI_CODEX_TRANSPORT, withOpenAICodexModels } from './model-catalog.ts'
 import type { OpenAICodexProxyManager } from './provider-proxy.ts'
+import type { OpenAICodexBackendRequests } from './backend-request.ts'
+import type { ReserveRequestPermits } from './reserve-state.ts'
+import { OPENAI_CODEX_RESERVE_MODEL, OPENAI_CODEX_RESERVE_NORMAL_MODEL } from './reserve-usage.ts'
+import { streamWithNativeCompactionScope, withOpenAICodexNativeCompaction } from './native-compaction.ts'
+import { streamWithCodexRequestDiagnostics, withCodexDiagnosticFetch } from './request-diagnostics.ts'
+import { imageSelectionHandleText } from './image-input-contract.ts'
 
-/** Official Codex id supplied when the installed pi-ai catalog predates Astra. */
-export const OPENAI_CODEX_ASTRA_MODEL_ID = 'gpt-6-astra'
+export { OPENAI_CODEX_ASTRA_MODEL_ID, OPENAI_CODEX_TRANSPORT, openAICodexModelCatalog, withOpenAICodexAstra, withOpenAICodexModels } from './model-catalog.ts'
 
-const OPENAI_CODEX_ASTRA_MODEL: Model<'openai-codex-responses'> = {
-  id: OPENAI_CODEX_ASTRA_MODEL_ID,
-  name: 'GPT-6-Astra',
-  api: 'openai-codex-responses',
-  provider: OPENAI_CODEX_PROVIDER,
-  baseUrl: 'https://chatgpt.com/backend-api',
-  reasoning: true,
-  input: ['text', 'image'],
-  // ChatGPT OAuth usage is read from the server; no authoritative token-price schedule is available here.
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 272_000,
-  maxTokens: 128_000,
-  thinkingLevelMap: { minimal: 'low', xhigh: 'xhigh', max: 'max' },
-  compat: {
-    supportsOpenAIGrammarTools: true,
-    supportsAdditionalTools: true,
-    supportsToolSearch: true,
-  },
-}
-
-/** Preserve an upstream Astra entry, or add the official compatibility fallback. */
-export function withOpenAICodexAstra(
-  provider: Provider<'openai-codex-responses'>,
-): Provider<'openai-codex-responses'> {
-  const baseline = provider.getModels()
-  if (baseline.some(model => model.id === OPENAI_CODEX_ASTRA_MODEL_ID)) return provider
-  const models = [OPENAI_CODEX_ASTRA_MODEL, ...baseline]
-  return { ...provider, getModels: () => models }
-}
-
-/** Return a detached copy of the effective Codex model catalog. */
-export function openAICodexModelCatalog(): readonly OpenAICodexModelCatalogEntry[] {
-  return withOpenAICodexAstra(openaiCodexProvider()).getModels().map(model => ({
-    id: model.id, name: model.name, contextWindow: model.contextWindow,
-    ...openAICodexContextLimit(model.id, model.contextWindow),
-  }))
+/** Omission preserves ordinary dispatch; authority stays with the live task runtime. */
+export interface OpenAICodexTaskDispatch {
+  /** Explicit legacy-task provider policy; ordinary profiles do not import it. */
+  wrapProvider?: (provider: Provider) => Provider
+  stream(options: GenerateOptions, delegate: (next: GenerateOptions) => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
 }
 
 /** Provider idle ceiling used by the composite route. */
@@ -65,13 +43,6 @@ export const OPENAI_CODEX_MAX_REQUEST_IMAGE_BYTES = 20 * 1024 * 1024
 export const OPENAI_CODEX_REQUEST_IMAGE_PIXEL_BUDGET = 2048 * 2048
 /** rc.2 default raw encoded-byte cap for one deterministic inline image version. */
 export const OPENAI_CODEX_REQUEST_IMAGE_MAX_BYTES = 1024 * 1024
-
-/**
- * Use the finite SSE response path for Codex requests. The automatic
- * WebSocket path keeps a session connection for prompt-cache reuse, which
- * can leave one-shot Headless processes alive after their final answer.
- */
-export const OPENAI_CODEX_TRANSPORT = 'sse' as const
 
 /**
  * Give the generic dsh adapter a request-scoped bearer-token entry without
@@ -95,6 +66,7 @@ export function withOpenAICodexFastMode(
       const sessionId = options?.sessionId
       const enabled = provider.id === OPENAI_CODEX_PROVIDER
         && model.provider === OPENAI_CODEX_PROVIDER
+        && model.id !== OPENAI_CODEX_RESERVE_MODEL
         && fastMode !== undefined
         && fastMode.isEnabled(sessionId)
       if (!enabled) return streamSimple.call(provider, model, context, options)
@@ -114,20 +86,39 @@ export function withOpenAICodexFastMode(
   }
 }
 
+/** Add an internal Luna route whose dispatch requires one fresh agent-request permit. */
+export function withOpenAICodexReserve(provider: Provider, permits: ReserveRequestPermits): Provider {
+  const models = provider.getModels().filter(model => model.id !== OPENAI_CODEX_RESERVE_MODEL)
+  const luna = models.find(model => model.id === OPENAI_CODEX_RESERVE_NORMAL_MODEL)
+  if (luna === undefined) throw new Error('Codex Reserve requires the Luna model catalog')
+  const reserve = { ...luna, id: OPENAI_CODEX_RESERVE_MODEL, name: 'Luna Reserve' }
+  return {
+    ...provider,
+    getModels: () => [...models, reserve],
+    streamSimple(model, context, options) {
+      if (model.id === OPENAI_CODEX_RESERVE_MODEL) permits.consume(options?.sessionId, options?.apiKey)
+      return provider.streamSimple(model, context, options)
+    },
+  }
+}
+
 function requestProvider(
   provider: Provider,
   fastMode?: FastModeRegistry,
   proxyManager?: OpenAICodexProxyManager,
   resolveProxyUrl?: () => string | undefined,
+  backendRequests?: OpenAICodexBackendRequests,
+  wrapProvider?: (provider: Provider) => Provider,
 ): Provider {
-  const configured = withOpenAICodexFastMode(provider, fastMode)
+  const ordinary = withOpenAICodexFastMode(withOpenAICodexNativeCompaction(provider), fastMode)
+  const configured = wrapProvider === undefined ? ordinary : wrapProvider(ordinary)
   const streamSimple = configured.streamSimple
   return {
     ...configured,
     streamSimple(model, context: PiContext, options?: SimpleStreamOptions) {
       const proxyUrl = resolveProxyUrl?.()
-      const operation = () => streamSimple.call(configured, model, context, options)
-      return proxyManager?.runStream(proxyUrl, operation) ?? operation()
+      const operation = () => streamSimple.call(configured, model, codexProviderContext(context), withCodexDiagnosticFetch(options, backendRequests))
+      return backendRequests?.runStream(operation) ?? proxyManager?.runStream(proxyUrl, operation) ?? operation()
     },
     auth: {
       ...provider.auth,
@@ -144,18 +135,20 @@ function requestProvider(
   }
 }
 
-/** Build the immutable profile consumed by the DSH pi-ai adapter. */
+/** Build the pi-ai profile with the model-error index required by DSH 0.1.7-rc.1. */
 export function createOpenAICodexProfile(
   provider: Provider,
   fastMode?: FastModeRegistry,
   proxyManager?: OpenAICodexProxyManager,
   resolveProxyUrl?: () => string | undefined,
   contextWindowOverrides?: Readonly<Record<string, number>> | undefined,
-): ResolvedPiAiProviderProfile {
+  backendRequests?: OpenAICodexBackendRequests,
+  wrapProvider?: (provider: Provider) => Provider,
+): ResolvedPiAiProviderProfile & { piProvider: Provider } {
   const effectiveProvider = contextWindowOverrides === undefined
     ? provider
     : withOpenAICodexContextWindowOverrides(provider, contextWindowOverrides)
-  return {
+  const profile = {
     provider: OPENAI_CODEX_PROVIDER,
     displayName: 'OpenAI Codex',
     transport: OPENAI_CODEX_TRANSPORT,
@@ -165,8 +158,10 @@ export function createOpenAICodexProfile(
     requestImageMaxBytes: OPENAI_CODEX_REQUEST_IMAGE_MAX_BYTES,
     retryPolicy: resolveRetryPolicy(undefined, 'dsh-codex-connect retryPolicy'),
     configuredMaxTokens: new Map(),
-    piProvider: requestProvider(effectiveProvider, fastMode, proxyManager, resolveProxyUrl),
+    modelErrors: new Map<string, string>(),
+    piProvider: requestProvider(effectiveProvider, fastMode, proxyManager, resolveProxyUrl, backendRequests, wrapProvider),
   }
+  return profile
 }
 
 /**
@@ -210,6 +205,27 @@ export function assertOpenAICodexContextWindowOverrides(
  * resolution, streaming, reasoning metadata, and compaction behavior; this
  * plugin supplies its provider-native OAuth token for each request.
  */
+/** Add stable selection handles next to request images without mutating durable messages. */
+export function withOpenAICodexImageSelectionHandles(options: GenerateOptions): GenerateOptions {
+  let changed = false
+  const messages = options.messages.map(message => {
+    let imageIndex = 0
+    let contentChanged = false
+    const content: ContentBlock[] = []
+    for (const block of message.content) {
+      content.push(block)
+      if (block.type !== 'image') continue
+      imageIndex += 1
+      content.push({ type: 'text', text: imageSelectionHandleText(imageIndex, block.attachment) })
+      contentChanged = true
+    }
+    if (!contentChanged) return message
+    changed = true
+    return { ...message, content }
+  })
+  return changed ? { ...options, messages } : options
+}
+
 export function createOpenAICodexAdapter(
   credentials: OpenAICodexCredentialStore,
   resolveAttachments: () => AttachmentStore | undefined,
@@ -218,14 +234,20 @@ export function createOpenAICodexAdapter(
   proxyManager?: OpenAICodexProxyManager,
   resolveProxyUrl?: () => string | undefined,
   contextWindowOverrides?: () => Readonly<Record<string, number>> | undefined,
+  reservePermits?: ReserveRequestPermits,
+  nativeCompactionEnabled?: () => boolean,
+  backendRequests?: OpenAICodexBackendRequests,
+  taskDispatch?: OpenAICodexTaskDispatch,
+  imageEditingEnabled?: () => boolean,
 ): PiAiAdapter {
-  const provider = withOpenAICodexAstra(openaiCodexProvider())
+  const baseline = withOpenAICodexModels(openaiCodexProvider())
+  const provider = reservePermits === undefined ? baseline : withOpenAICodexReserve(baseline, reservePermits)
   let profiles: Map<string, ResolvedPiAiProviderProfile> | undefined
   let previousOverrides: Readonly<Record<string, number>> | undefined
   const currentProfiles = (): Map<string, ResolvedPiAiProviderProfile> => {
     const overrides = contextWindowOverrides?.()
     if (profiles === undefined || !deepEqualJson(previousOverrides, overrides)) {
-      const profile = createOpenAICodexProfile(provider, fastMode, proxyManager, resolveProxyUrl, overrides)
+      const profile = createOpenAICodexProfile(provider, fastMode, proxyManager, resolveProxyUrl, overrides, backendRequests, taskDispatch?.wrapProvider)
       previousOverrides = overrides === undefined ? undefined : { ...overrides }
       // PiAiAdapter keys snapshots by map identity; captured calls keep the old map.
       profiles = new Map([[OPENAI_CODEX_PROVIDER, profile]])
@@ -233,8 +255,34 @@ export function createOpenAICodexAdapter(
     return profiles
   }
   class OpenAICodexAdapter extends PiAiAdapter {
+    private streamPrepared(
+      stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>,
+      options: GenerateOptions,
+    ): AsyncIterable<StreamChunk> {
+      const dispatch = (request: GenerateOptions) => {
+        const projected = imageEditingEnabled?.() === true ? withOpenAICodexImageSelectionHandles(request) : request
+        const observed = (nextOptions: GenerateOptions) => streamWithCodexRequestDiagnostics(
+          next => streamWithNativeCompactionScope(stream, next, nativeCompactionEnabled?.() === true), nextOptions,
+        )
+        return backendRequests?.metrics?.stream(observed, projected) ?? observed(projected)
+      }
+      return taskDispatch?.stream(options, dispatch) ?? dispatch(options)
+    }
+
+    override async prepareCall(providerId: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+      const prepared = await super.prepareCall(providerId, model, signal)
+      return {
+        model: prepared.model,
+        stream: options => this.streamPrepared(prepared.stream, options),
+      }
+    }
+
+    override stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+      return this.streamPrepared(next => super.stream(next), options)
+    }
+
     override async listModels(providerId: string) {
-      const catalog = await super.listModels(providerId)
+      const catalog = (await super.listModels(providerId)).filter(model => model.id !== OPENAI_CODEX_RESERVE_MODEL)
       const configured = visibleModelIds?.()
       if (configured === undefined) return catalog
       const visible = new Set(configured)
@@ -244,15 +292,11 @@ export function createOpenAICodexAdapter(
   return new OpenAICodexAdapter({
     profiles: currentProfiles,
     resolveApiKey: async () => {
-      const operation = async () => {
-        const requestCredentials = await credentials.captureActiveAccount()
-        const requestModels: MutableModels = createModels({ credentials: requestCredentials })
-        requestModels.setProvider(provider)
-        return (await requestModels.getAuth(OPENAI_CODEX_PROVIDER))?.auth.apiKey
-      }
+      const operation = async () => (await readOpenAICodexRequestAuth(credentials)).access
       return proxyManager?.run(resolveProxyUrl?.(), operation) ?? operation()
     },
-    auth: { credentials, authContext: defaultProviderAuthContext() },
+    // Host-side auth accepts only the explicit bearer token resolved above.
+    auth: { credentials: new InMemoryCredentialStore(), authContext: defaultProviderAuthContext() },
     resolveAttachments,
   })
 }

@@ -10,6 +10,7 @@ import {
   OPENAI_CODEX_TRANSPORT,
   OPENAI_CODEX_ASTRA_MODEL_ID,
   withOpenAICodexAstra,
+  withOpenAICodexModels,
   withOpenAICodexContextWindowOverrides,
 } from '../src/adapter.ts'
 import type { OpenAICodexCredentialStore } from '../src/store.ts'
@@ -17,7 +18,27 @@ import { OPENAI_CODEX_PROVIDER } from '../src/store.ts'
 import { Config } from '../src/index.ts'
 
 describe('OpenAI Codex rc.2 adapter profile', () => {
-  it('adds Astra exactly once while preserving upstream ownership when it appears', () => {
+  it.each(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'])('adds missing %s without duplicating or overwriting native metadata', id => {
+    const provider = openaiCodexProvider()
+    const baseline = provider.getModels().filter(model => model.id !== id)
+    const patched = withOpenAICodexModels({ ...provider, getModels: () => baseline })
+    const fallback = patched.getModels().find(model => model.id === id)!
+    expect(fallback).toMatchObject({ id, contextWindow: 272_000, maxTokens: 128_000,
+      provider: OPENAI_CODEX_PROVIDER, api: 'openai-codex-responses', input: ['text', 'image'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })
+    const native = { ...fallback, name: 'Native model', contextWindow: 300_000, maxTokens: 64_000,
+      cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }, compat: { supportsStrictMode: false },
+      thinkingLevelMap: { minimal: 'minimal' as const } }
+    const result = withOpenAICodexModels({ ...provider, getModels: () => [native, ...baseline] }).getModels()
+    expect(result.filter(model => model.id === id)).toEqual([{ ...native,
+      thinkingLevelMap: { off: null, minimal: null, xhigh: 'xhigh', max: 'max' } }])
+    expect(native.thinkingLevelMap).toEqual({ minimal: 'minimal' })
+    for (const old of baseline.filter(model => model.id !== OPENAI_CODEX_ASTRA_MODEL_ID && !['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(model.id))) {
+      expect(result.find(model => model.id === old.id)).toBe(old)
+    }
+  })
+
+  it('preserves upstream Astra metadata while retaining calibrated reasoning choices', () => {
     const provider = openaiCodexProvider()
     const withoutAstra = {
       ...provider,
@@ -35,16 +56,18 @@ describe('OpenAI Codex rc.2 adapter profile', () => {
       maxTokens: 128_000,
     })])
 
-    const upstreamAstra = { ...astra[0]!, name: 'Upstream Astra', contextWindow: 300_000 }
+    const upstreamAstra = { ...astra[0]!, name: 'Upstream Astra', contextWindow: 300_000, thinkingLevelMap: { minimal: 'minimal' as const } }
     const upstreamProvider = { ...provider, getModels: () => [upstreamAstra, ...withoutAstra.getModels()] }
     const preserved = withOpenAICodexAstra(upstreamProvider)
-    expect(preserved).toBe(upstreamProvider)
-    expect(preserved.getModels()[0]).toBe(upstreamAstra)
+    expect(preserved.getModels()[0]).toEqual({ ...upstreamAstra, thinkingLevelMap: { off: null, minimal: null, xhigh: 'xhigh', max: 'max' } })
+    expect(upstreamAstra.thinkingLevelMap).toEqual({ minimal: 'minimal' })
+    expect(preserved.getModels().slice(1)).toEqual(withoutAstra.getModels())
+    expect(preserved.getModels().filter(model => model.id === OPENAI_CODEX_ASTRA_MODEL_ID)).toHaveLength(1)
   })
 
   it('distinguishes an omitted model list from an explicitly empty list', () => {
-    expect(Config({}).models).toBeUndefined()
-    expect(Config({ models: [] }).models).toEqual([])
+    expect(Config({}).models.get()).toBeUndefined()
+    expect(Config({ models: [] }).models.get()).toEqual([])
   })
 
   it('supplies all request-image defaults required by ResolvedPiAiProviderProfile', () => {
@@ -96,6 +119,16 @@ describe('OpenAI Codex rc.2 adapter profile', () => {
       id: OPENAI_CODEX_ASTRA_MODEL_ID,
     })
   })
+
+  it('resolves every advertised model and prepares its request without accessing credentials', async () => {
+    const adapter = createOpenAICodexAdapter({} as OpenAICodexCredentialStore, () => undefined)
+    const listed = await adapter.listModels(OPENAI_CODEX_PROVIDER)
+    expect(listed).toContainEqual(expect.objectContaining({ id: 'gpt-5.6-luna' }))
+    for (const model of listed) {
+      await expect(adapter.resolveModel(OPENAI_CODEX_PROVIDER, model.id)).resolves.toMatchObject({ id: model.id })
+      await expect(adapter.prepareCall(OPENAI_CODEX_PROVIDER, model.id)).resolves.toMatchObject({ model: { id: model.id } })
+    }
+  })
 })
 
 describe('context-window overrides', () => {
@@ -123,9 +156,9 @@ describe('context-window overrides', () => {
   })
 
   it('accepts a contextWindowOverrides config section', () => {
-    expect(Config({ contextWindowOverrides: { 'gpt-5.6-sol': 350_000 } }).contextWindowOverrides)
+    expect(Config({ contextWindowOverrides: { 'gpt-5.6-sol': 350_000 } }).contextWindowOverrides.get())
       .toEqual({ 'gpt-5.6-sol': 350_000 })
-    expect(Config({}).contextWindowOverrides).toBeUndefined()
+    expect(Config({}).contextWindowOverrides.get()).toBeUndefined()
   })
 
   it('withOpenAICodexContextWindowOverrides does not mutate the baseline provider', () => {

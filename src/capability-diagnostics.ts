@@ -1,8 +1,8 @@
 /** Evidence-scoped diagnostics, separate from model routing and durable sessions. */
 
 import { createHash } from 'node:crypto'
-import { openAICodexModelCatalog, OPENAI_CODEX_TRANSPORT } from './adapter.ts'
-import { evaluateCompatibility, DSH_PLUGIN_API_PACKAGES, readInstalledPackageVersion, SUPPORTED_DSH_PLUGIN_API_VERSION } from './compatibility.ts'
+import { openAICodexModelCatalog, OPENAI_CODEX_TRANSPORT } from './model-catalog.ts'
+import { evaluateCompatibility, DSH_PLUGIN_API_PACKAGES, readInstalledPackageVersion, isSupportedDshPluginApiVersion } from './compatibility.ts'
 import { diagnoseOpenAICodex } from './doctor.ts'
 import { probeCodexResponses } from './capability-probe.ts'
 import type { ResponsesProbeEvidence, ResponsesProbeRequest } from './capability-probe.ts'
@@ -120,10 +120,12 @@ export class CodexCapabilityDiagnostics {
     const compatibility = evaluateCompatibility({ nodeVersion: versions['node'] ?? null, packageVersions: versions })
     const missing = Object.values(versions).some(value => value === null)
       || !/^v?\d+\.\d+\.\d+$/u.test(versions['node'] ?? '')
-    const mismatch = DSH_PLUGIN_API_PACKAGES.some(name => versions[name] !== null && versions[name] !== SUPPORTED_DSH_PLUGIN_API_VERSION)
-      || compatibility.status === 'incompatible'
+    const dshVersion = versions['@deepseek-ai/dsh-llm']
+    const mismatch = DSH_PLUGIN_API_PACKAGES.some(name => versions[name] !== null
+      && (!isSupportedDshPluginApiVersion(versions[name]!) || versions[name] !== dshVersion))
+      || compatibility.status === 'incompatible' || compatibility.status === 'unverified'
     const runtime = mismatch
-      ? result('rejected', 'declared-version-mismatch', 'Use DSH API 0.1.2-rc.1 and pi-ai ^0.84.2 together. DSH 0.1.0-rc.7 requires Codex Connect 0.1.0-alpha.4.14.')
+      ? result('rejected', 'declared-version-mismatch', 'Use DSH plugin API 0.1.7-rc.1 or 0.1.7-rc.2 with pi-ai 0.85.1, keeping every declared DSH API package at the same exact version. Older, newer and mixed combinations are not verified by this candidate.')
       : missing || compatibility.status === 'unknown'
         ? result('unknown', 'version-metadata-unavailable', 'Run this command from the plugin installation in the intended profile.')
         : result('supported', 'declared-host-versions-match', 'Host package versions satisfy the declared requirements; this is not a live profile or browser compatibility test.')

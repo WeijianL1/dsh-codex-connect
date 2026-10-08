@@ -26,7 +26,6 @@ export default [
     entry: {
       index: 'src/index.ts',
       invariant: 'src/invariant.ts',
-      bin: 'src/bin.ts',
     },
     outDir: 'lib',
     format: ['esm'],
@@ -38,7 +37,7 @@ export default [
     // Keep dispatcher preservation ahead of external providers' initialization.
     outputOptions: {
       codeSplitting: {
-        groups: [{ name: 'undici-runtime', test: /\/src\/undici-runtime\.ts$/u }],
+        groups: [{ name: 'undici-runtime', test: /[\\/]src[\\/]undici-runtime\.ts$/u }],
       },
     },
     define: {
@@ -61,6 +60,20 @@ export default [
         '@deepseek-ai/dsh-tools',
         '@deepseek-ai/dsh-web',
       ],
+    },
+  },
+  {
+    entry: { bin: 'src/bin.ts' },
+    outDir: 'lib',
+    format: ['esm'],
+    platform: 'node',
+    target: 'es2024',
+    fixedExtension: false,
+    dts: false,
+    clean: false,
+    deps: { alwaysBundle: [/.*/u] },
+    define: {
+      __CODEX_CONNECT_VERSION__: JSON.stringify(PACKAGE_VERSION),
     },
   },
   {

@@ -96,6 +96,50 @@
     {
       "version": "0.1.0-alpha.4.28",
       "highlights": []
+    },
+    {
+      "version": "0.1.0-alpha.4.29",
+      "highlights": []
+    },
+    {
+      "version": "0.1.0-alpha.4.33",
+      "highlights": ["runtime-compatibility"]
+    },
+    {
+      "version": "0.1.0-alpha.4.34",
+      "highlights": ["runtime-compatibility", "image-model-hint"]
+    },
+    {
+      "version": "0.1.0-alpha.4.35",
+      "highlights": ["luna-reserve"]
+    },
+    {
+      "version": "0.1.0-alpha.4.36",
+      "highlights": ["image-generation"]
+    },
+    {
+      "version": "0.1.0-alpha.4.43",
+      "highlights": ["runtime-compatibility"]
+    },
+    {
+      "version": "0.1.0-alpha.4.45",
+      "highlights": ["image-generation"]
+    },
+    {
+      "version": "0.1.0-alpha.4.46",
+      "highlights": ["proxy-connection"]
+    },
+    {
+      "version": "0.1.0-alpha.4.47",
+      "highlights": ["runtime-compatibility"]
+    },
+    {
+      "version": "0.1.0-alpha.4.48",
+      "highlights": ["image-generation", "quota-fast-mode"]
+    },
+    {
+      "version": "0.2.0-alpha.2",
+      "highlights": ["runtime-compatibility", "image-generation"]
     }
   ]
 }

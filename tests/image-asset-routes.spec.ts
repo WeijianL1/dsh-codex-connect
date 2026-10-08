@@ -11,6 +11,7 @@ import { OPENAI_CODEX_ORIGINAL_IMAGE_PATH } from '../src/image-assets-contract.t
 import type { OpenAICodexOriginalImageRef } from '../src/image-assets-contract.ts'
 import { registerOpenAICodexOriginalImageRoute } from '../src/image-asset-routes.ts'
 import type { OpenAICodexTrustedOriginsStore } from '../src/trusted-origins.ts'
+import { IMAGE_RESULT_PREFIX, IMAGE_EDIT_RESULT_PREFIX } from '../src/image-presentation.ts'
 
 const PNG_1X1 = Uint8Array.from(Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
@@ -90,6 +91,51 @@ function response(): ServerResponse & { status?: number; headers?: Record<string
 }
 
 describe('OpenAI Codex original image download route', () => {
+  it.each(['tool/code-dispatch', 'tool/ptc-dispatch'])('authorizes only inherited successful %s original references', async (type) => {
+    root = await mkdtemp(join(tmpdir(), 'codex-image-ptc-'))
+    const store = new OpenAICodexImageAssetStore(root)
+    const [ref] = await store.saveImages('owner', [{ data: PNG_1X1, mediaType: 'image/png', width: 1, height: 1, name: 'original.png' }])
+    if (ref === undefined) throw new Error('missing image')
+    const preview = { attachmentId: 'preview-1', mediaType: 'image/png', width: 1, height: 1, bytes: PNG_1X1.byteLength }
+    const data = { name: 'codex_connect_image_generate', isError: false, arguments: { prompt: 'draw' }, content: [
+      { type: 'text', text: IMAGE_RESULT_PREFIX + JSON.stringify([{ original: ref, preview }]) },
+      { type: 'image', attachment: preview },
+    ] }
+    const makeRoute = (event: unknown, boundary = 1) => capture(store, { get: () => ({ header: { parentSession: 'owner' }, inheritedEventCount: boundary, snapshotEvents: () => [event] }) } as unknown as SessionStore)
+    expect((await download(makeRoute({ type, seq: 0, data }), 'child', ref.assetId)).status).toBe(200)
+    expect((await download(makeRoute({ type, seq: 0, data }, 0), 'child', ref.assetId)).status).toBe(404)
+    expect((await download(makeRoute({ type, seq: 0, data: { ...data, isError: true } }), 'child', ref.assetId)).status).toBe(404)
+    expect((await download(makeRoute({ type, seq: 0, data: { ...data, name: 'another-tool' } }), 'child', ref.assetId)).status).toBe(404)
+  })
+  it.each(['tool/code-dispatch', 'tool/ptc-dispatch'])('review: downloads inherited v2 %s edits with trimmed instructions', async type => {
+    root = await mkdtemp(join(tmpdir(), 'codex-edit-fork-trim-'))
+    const store = new OpenAICodexImageAssetStore(root)
+    const [original] = await store.saveImages('owner', [{ data: PNG_1X1, mediaType: 'image/png', width: 1, height: 1, name: 'edited.png' }])
+    if (original === undefined) throw new Error('missing fixture original')
+    const preview = { attachmentId: 'preview-edit', mediaType: 'image/png', width: 1, height: 1, bytes: PNG_1X1.byteLength }
+    const meta = { kind: 'codex-connect-images', schemaVersion: 2, operation: 'edit', prompt: 'change background',
+      images: [{ original, preview }], edit: { target: { attachmentId: 'uploaded-image' }, references: [] } }
+    const event = { type, seq: 0, data: { name: 'codex_connect_image_generate', isError: false,
+      arguments: { operation: 'edit', prompt: '  change background  ', target: { attachmentId: 'uploaded-image' } },
+      content: [{ type: 'text', text: IMAGE_EDIT_RESULT_PREFIX + JSON.stringify(meta) }, { type: 'image', attachment: preview }] } }
+    const sessions = { get: () => ({ header: { parentSession: 'owner' }, inheritedEventCount: 1, snapshotEvents: () => [event] }) } as unknown as SessionStore
+    expect((await download(capture(store, sessions), 'child', original.assetId)).status).toBe(200)
+  })
+
+  it('review: a failed native result cannot authorize an inherited original', async () => {
+    root = await mkdtemp(join(tmpdir(), 'codex-edit-failed-grant-'))
+    const store = new OpenAICodexImageAssetStore(root)
+    const [original] = await store.saveImages('owner', [{ data: PNG_1X1, mediaType: 'image/png', width: 1, height: 1, name: 'original.png' }])
+    if (original === undefined) throw new Error('missing fixture original')
+    const preview = { attachmentId: 'preview-denied', mediaType: 'image/png', width: 1, height: 1, bytes: PNG_1X1.byteLength }
+    const event = { type: 'tool/result', seq: 0, data: {
+      message: { isError: true, content: [] },
+      meta: { kind: 'codex-connect-images', schemaVersion: 1, prompt: 'failed', images: [{ original, preview }] },
+    } }
+    const sessions = { get: () => ({ header: { parentSession: 'owner' }, inheritedEventCount: 1, snapshotEvents: () => [event] }) } as unknown as SessionStore
+    expect((await download(capture(store, sessions), 'child', original.assetId)).status).toBe(404)
+  })
+
   it('downloads inherited originals through nested forks and restored sessions without loading ancestors', async () => {
     root = await mkdtemp(join(tmpdir(), 'codex-image-fork-'))
     const ctx = await sessionContext()
@@ -107,14 +153,17 @@ describe('OpenAI Codex original image download route', () => {
       expect(Buffer.from(res.body as Uint8Array)).toEqual(Buffer.from(PNG_1X1))
     }
 
-    const restored = Session.fromRestore(
-      grandchild.id,
-      JSON.parse(JSON.stringify(grandchild.snapshotEvents())),
-      JSON.parse(JSON.stringify(grandchild.header)),
-      grandchild.inheritedEventCount,
-    )
+    // rc.1 names persistence ownership; alpha names the detached seed's aliasing state.
+    const restoredOptions = {
+      seed: JSON.parse(JSON.stringify(grandchild.snapshotEvents())),
+      meta: JSON.parse(JSON.stringify(grandchild.header)),
+      inheritedEventCount: grandchild.inheritedEventCount,
+      seedSource: 'persistence' as const,
+      eventState: 'detached' as const,
+    }
     await ctx.fiber.dispose()
     const reopened = await sessionContext()
+    const restored = reopened.sessions.prepare(grandchild.id, restoredOptions)
     reopened.sessions.enter(restored)
     reopened.sessions.announce(restored)
     expect(reopened.sessions.get(parent.id)).toBeUndefined()

@@ -7,27 +7,13 @@ import LocalAttachmentStore from '@deepseek-ai/dsh-attachment-local'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import * as PiAiRuntime from '@deepseek-ai/dsh-llm-pi-ai'
-import SettingsProvider from '@deepseek-ai/dsh-settings'
-import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import WebRuntime from '@deepseek-ai/dsh-web'
 import * as OpenAICodex from '../src/index.ts'
-
-class MemorySettings extends SettingsProvider {
-  readonly writable = true
-  private storedDocument: Record<string, unknown> = {}
-
-  protected load(): Promise<Record<string, unknown>> {
-    return Promise.resolve(structuredClone(this.storedDocument))
-  }
-
-  protected persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
-    this.storedDocument[ns] = structuredClone(section)
-    return Promise.resolve()
-  }
-}
+import { OpenAICodexCredentialStore } from '../src/store.ts'
+import { loadSettingsPlugin } from './support/settings-loader-fixture.ts'
 
 let context: Context | undefined
 let root: string | undefined
@@ -38,9 +24,40 @@ afterEach(async () => {
   if (root !== undefined) await rm(root, { recursive: true, force: true })
   root = undefined
   vi.unstubAllEnvs()
+  vi.unstubAllGlobals()
 })
 
 describe('OpenAI Codex Host settings integration', () => {
+  it('uses saved image hints on the next request and preserves a cleared override after plugin reload', async () => {
+    root = await mkdtemp(join(tmpdir(), 'dsh-codex-connect-image-settings-'))
+    vi.stubEnv('DSH_HOME', root)
+    const store = new OpenAICodexCredentialStore()
+    await store.modify(OpenAICodex.OPENAI_CODEX_PROVIDER, async () => ({
+      type: 'oauth', access: 'fixture-access', refresh: 'fixture-refresh', accountId: 'fixture-account', expires: Date.now() + 3_600_000,
+    }))
+    const models: string[] = []
+    vi.stubGlobal('fetch', async (_input: string | URL | Request, init?: RequestInit) => {
+      models.push((JSON.parse(String(init?.body)) as { model: string }).model)
+      return Response.json({ data: [{ b64_json: 'aGVsbG8=' }] })
+    })
+    const ctx = new Context()
+    context = ctx
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(PiAiRuntime, {})
+    const { entry } = await loadSettingsPlugin(ctx, root, 'dsh-codex-connect', OpenAICodex, {
+      imageModelHint: 'composition-route',
+    })
+    const generate = () => ctx.openaiCodexTransport.generateImages({ prompt: 'fixture' }, {})
+    await generate()
+    await ctx.settings.update(OpenAICodex.OPENAI_CODEX_SETTINGS_NS, { imageModelHint: 'saved-route' })
+    await generate()
+    await ctx.settings.update(OpenAICodex.OPENAI_CODEX_SETTINGS_NS, { imageModelHint: '' })
+    await generate()
+    await entry.update({ config: entry.options.config }, false, true)
+    await generate()
+    expect(models).toEqual(['composition-route', 'saved-route', 'gpt-image-2', 'gpt-image-2'])
+  })
+
   it('exposes OpenAI Codex, applies optional capabilities, and owns the search route while enabled', async () => {
     root = await mkdtemp(join(tmpdir(), 'dsh-codex-connect-settings-'))
     vi.stubEnv('DSH_HOME', root)
@@ -59,8 +76,7 @@ describe('OpenAI Codex Host settings integration', () => {
     await ctx.plugin(ToolRuntime, { mode: 'native' })
     await ctx.plugin(LocalFileSystem, { cwd: workspace })
     await ctx.plugin(LocalAttachmentStore, { dshHome: root })
-    await ctx.plugin(MemorySettings)
-    const plugin = await ctx.plugin(OpenAICodex, { oauthTimeoutMs: 120_000 })
+    const { entry } = await loadSettingsPlugin(ctx, root, 'dsh-codex-connect', OpenAICodex, { oauthTimeoutMs: 120_000 })
 
     expect(ctx.llm.listConfigurableProviders()).toContainEqual({
       provider: 'openai-codex',
@@ -70,7 +86,20 @@ describe('OpenAI Codex Host settings integration', () => {
       declared: false,
     })
     const descriptor = ctx.settings.describe().find(entry => entry.ns === OpenAICodex.OPENAI_CODEX_SETTINGS_NS)
-    expect(descriptor?.value).toEqual({ ...OpenAICodex.DEFAULT_OPENAI_CODEX_SETTINGS, oauthTimeoutMs: 120_000 })
+    expect(descriptor?.value).toMatchObject({
+      enableProxy: false,
+      proxyUrl: OpenAICodex.DEFAULT_OPENAI_CODEX_SETTINGS.proxyUrl,
+      enableSearch: false,
+      enableReserveFallback: false,
+      enableNewSessionFastMode: false,
+      enableNewSubagentFastMode: false,
+      enableNativeCompaction: false,
+      enableImageTool: false,
+      enableImageGeneration: false,
+      imageModelHint: '',
+      autoReviewDisclosureAcknowledged: false,
+      enableAutoReview: false,
+    })
     const fullCatalog = await ctx.llm.listModels(OpenAICodex.OPENAI_CODEX_PROVIDER)
     expect(fullCatalog.length).toBeGreaterThan(2)
     expect(ctx.tools.get(OpenAICodex.VIEW_IMAGE_TOOL_NAME)).toBeUndefined()
@@ -87,6 +116,9 @@ describe('OpenAI Codex Host settings integration', () => {
       enableSearch: true,
       enableImageTool: true,
       enableImageGeneration: true,
+      enableNewSessionFastMode: true,
+      enableNewSubagentFastMode: true,
+      imageModelHint: 'custom-image-route',
       searchModel: 'gpt-search-settings-test',
       searchMode: 'live',
       searchContextSize: 'high',
@@ -99,6 +131,15 @@ describe('OpenAI Codex Host settings integration', () => {
     await vi.waitFor(async () => {
       await expect(ctx.web.search({ query: 'enabled' })).rejects.toMatchObject({ code: 'WEB_PROVIDER_CREDENTIAL_MISSING' })
     })
+    expect(ctx.settings.describe().find(entry => entry.ns === OpenAICodex.OPENAI_CODEX_SETTINGS_NS)?.value)
+      .toMatchObject({ imageModelHint: 'custom-image-route', enableNewSessionFastMode: true, enableNewSubagentFastMode: true })
+    await expect(ctx.settings.update(OpenAICodex.OPENAI_CODEX_SETTINGS_NS, { imageModelHint: 'https://invalid.example' }))
+      .rejects.toThrow()
+    expect(ctx.settings.describe().find(entry => entry.ns === OpenAICodex.OPENAI_CODEX_SETTINGS_NS)?.value)
+      .toMatchObject({ imageModelHint: 'custom-image-route' })
+    await ctx.settings.update(OpenAICodex.OPENAI_CODEX_SETTINGS_NS, { imageModelHint: '' })
+    expect(OpenAICodex.resolveOpenAICodexSettings(ctx.settings.describe().find(entry => entry.ns === OpenAICodex.OPENAI_CODEX_SETTINGS_NS)?.value ?? {}).imageModelHint)
+      .toBe('')
     await expect(ctx.llm.listModels(OpenAICodex.OPENAI_CODEX_PROVIDER)).resolves.toEqual([
       fullCatalog[0],
       fullCatalog[1],
@@ -118,9 +159,9 @@ describe('OpenAI Codex Host settings integration', () => {
     })
     await expect(ctx.web.search({ query: 'disabled again' })).resolves.toMatchObject({ content: 'DeepSeek search' })
     expect(ctx.settings.describe().find(entry => entry.ns === OpenAICodex.OPENAI_CODEX_SETTINGS_NS)?.value)
-      .toMatchObject({ oauthTimeoutMs: 120_000 })
+      .toMatchObject({ enableSearch: false, enableImageTool: false, enableImageGeneration: false })
 
-    await plugin.dispose()
+    await entry.fiber?.dispose()
     expect(ctx.llm.listConfigurableProviders()).toContainEqual({
       provider: 'openai-codex',
       displayName: 'openai-codex',

@@ -13,8 +13,10 @@ import {
   readOpenAICodexRateLimits,
 } from './usage.ts'
 import type { OpenAICodexUsage } from './usage.ts'
+import type { OpenAICodexQuotaState } from './quota-state.ts'
 import {
   OPENAI_CODEX_AUTH_LOGIN_PATH,
+  OPENAI_CODEX_AUTH_CALLBACK_PATH,
   OPENAI_CODEX_AUTH_LOGOUT_PATH,
   OPENAI_CODEX_AUTH_STATUS_PATH,
   OPENAI_CODEX_AUTH_CANCEL_PATH,
@@ -32,6 +34,7 @@ import { publicAuthError as safeMessage } from './auth-error.ts'
 
 export {
   OPENAI_CODEX_AUTH_LOGIN_PATH,
+  OPENAI_CODEX_AUTH_CALLBACK_PATH,
   OPENAI_CODEX_AUTH_LOGOUT_PATH,
   OPENAI_CODEX_AUTH_STATUS_PATH,
   OPENAI_CODEX_AUTH_CANCEL_PATH,
@@ -67,6 +70,8 @@ export interface OpenAICodexWebAuthOptions {
   proxyManager?: OpenAICodexProxyManager | undefined
   /** Resolve the explicitly activated proxy for each operation. */
   resolveProxyUrl?: (() => string | undefined) | undefined
+  /** Shared server-owned quota state; UI never receives its account-bound routing fields. */
+  quotaState?: OpenAICodexQuotaState | undefined
 }
 
 /** Reject with the prompt's abort reason while browser callback owns completion. */
@@ -77,6 +82,36 @@ function waitForPromptAbort(prompt: AuthPrompt, operationSignal: AbortSignal): P
   return new Promise<string>((_resolve, reject) => {
     signal.addEventListener('abort', () => { reject(signal.reason) }, { once: true })
   })
+}
+
+const OAUTH_REDIRECT_URI = 'http://localhost:1455/auth/callback'
+
+interface PendingManualPrompt {
+  resolve(value: string): void
+  reject(error: unknown): void
+}
+
+/** Validate locally; never navigate to, fetch, or include the submitted URL in errors. */
+function validCallbackUrl(value: string, challenge: LoginChallenge): boolean {
+  // Do not allow URL parser normalization to turn a different redirect into the expected one.
+  if (value.split('?')[0] !== OAUTH_REDIRECT_URI || /[\s\\#]/u.test(value)) return false
+  try {
+    const callback = new URL(value)
+    const authorization = new URL(challenge.url)
+    const redirects = authorization.searchParams.getAll('redirect_uri')
+    const expectedStates = authorization.searchParams.getAll('state')
+    const codes = callback.searchParams.getAll('code')
+    const states = callback.searchParams.getAll('state')
+    const keys = [...callback.searchParams.keys()]
+    return new Set(keys).size === keys.length
+      && redirects.length === 1 && redirects[0] === OAUTH_REDIRECT_URI
+      && expectedStates.length === 1 && expectedStates[0]!.trim() !== ''
+      && codes.length === 1 && codes[0]!.trim() !== ''
+      && states.length === 1 && states[0]!.trim() !== '' && states[0] === expectedStates[0]
+      && !keys.some(key => key === 'error' || key.startsWith('error_'))
+  } catch {
+    return false
+  }
 }
 
 /** One lifecycle owner for the callback server, challenge, and public status. */
@@ -90,10 +125,13 @@ export class OpenAICodexWebAuth {
   private authorizationTimer: ReturnType<typeof setTimeout> | undefined
   private transition: Promise<void> | undefined
   private disposed = false
+  private pendingManualPrompt: PendingManualPrompt | undefined
+  private manualPromptClosed = false
   private readonly challengeTimeoutMs: number
   private readonly authorizationTimeoutMs: number
   private readonly proxyManager: OpenAICodexProxyManager | undefined
   private readonly resolveProxyUrl: () => string | undefined
+  private readonly quotaState: OpenAICodexQuotaState | undefined
 
   constructor(
     private readonly store: OpenAICodexCredentialStore,
@@ -103,6 +141,7 @@ export class OpenAICodexWebAuth {
     this.authorizationTimeoutMs = options.authorizationTimeoutMs ?? OPENAI_CODEX_AUTHORIZATION_TIMEOUT_MS
     this.proxyManager = options.proxyManager
     this.resolveProxyUrl = options.resolveProxyUrl ?? (() => undefined)
+    this.quotaState = options.quotaState
     if (!Number.isFinite(this.challengeTimeoutMs) || this.challengeTimeoutMs <= 0) {
       throw new TypeError('OpenAI Codex auth URL timeout must be a positive finite number')
     }
@@ -126,6 +165,38 @@ export class OpenAICodexWebAuth {
     if (this.challenge !== undefined) return this.challenge
     return new Promise<LoginChallenge>((resolve, reject) => {
       this.challengeWaiters.push({ resolve, reject })
+    })
+  }
+
+  /** Accept exactly once, without waiting for token exchange or quota retrieval. */
+  submitCallback(callbackUrl: string): 200 | 400 | 409 {
+    const pending = this.pendingManualPrompt
+    if (this.disposed || this.transition !== undefined || this.cancellation?.signal.aborted !== false
+      || pending === undefined || this.challenge === undefined) return 409
+    if (!validCallbackUrl(callbackUrl, this.challenge)) return 400
+    this.manualPromptClosed = true
+    pending.resolve(callbackUrl)
+    return 200
+  }
+
+  private waitForManualPrompt(prompt: AuthPrompt, operationSignal: AbortSignal): Promise<string> {
+    const signal = prompt.signal === undefined ? operationSignal : AbortSignal.any([prompt.signal, operationSignal])
+    if (signal.aborted) return Promise.reject(signal.reason)
+    if (this.cancellation?.signal !== operationSignal || this.pendingManualPrompt !== undefined || this.manualPromptClosed) {
+      return Promise.reject(new Error('OpenAI Codex manual callback is unavailable'))
+    }
+    return new Promise<string>((resolve, reject) => {
+      const clear = () => {
+        signal.removeEventListener('abort', abort)
+        if (this.pendingManualPrompt === pending) this.pendingManualPrompt = undefined
+      }
+      const pending: PendingManualPrompt = {
+        resolve: value => { clear(); resolve(value) },
+        reject: error => { clear(); reject(error) },
+      }
+      const abort = () => { this.manualPromptClosed = true; pending.reject(signal.reason) }
+      this.pendingManualPrompt = pending
+      signal.addEventListener('abort', abort, { once: true })
     })
   }
 
@@ -164,6 +235,7 @@ export class OpenAICodexWebAuth {
       this.challenge = undefined
       if (action === 'logout') {
         await logoutOpenAICodex(this.store)
+        this.quotaState?.invalidate()
         this.state = { status: 'signed-out' }
       } else if (action === 'cancel') {
         this.state = await this.readStoredStatus()
@@ -185,6 +257,7 @@ export class OpenAICodexWebAuth {
       await login?.catch(() => undefined)
       this.challenge = undefined
       await operation()
+      this.quotaState?.invalidate()
       result = await this.readStoredStatus()
       this.state = result
     })()
@@ -201,6 +274,7 @@ export class OpenAICodexWebAuth {
   private start(): void {
     const cancellation = new AbortController()
     this.cancellation = cancellation
+    this.manualPromptClosed = false
     this.challenge = undefined
     this.state = { status: 'signing-in' }
     this.challengeTimer = setTimeout(() => {
@@ -215,11 +289,18 @@ export class OpenAICodexWebAuth {
       signal: cancellation.signal,
       prompt: prompt => prompt.type === 'select'
         ? Promise.resolve('browser')
-        : waitForPromptAbort(prompt, cancellation.signal),
-      notify: event => { this.onEvent(event) },
+        : prompt.type === 'manual_code'
+          ? this.waitForManualPrompt(prompt, cancellation.signal)
+          : waitForPromptAbort(prompt, cancellation.signal),
+      notify: event => {
+        if (this.cancellation === cancellation && !cancellation.signal.aborted) this.onEvent(event)
+      },
     }, this.store)
     this.operation = (this.proxyManager?.run(this.resolveProxyUrl(), login) ?? login()).then(
       async () => {
+        this.quotaState?.invalidate()
+        this.manualPromptClosed = true
+        this.pendingManualPrompt?.reject(new Error('OpenAI Codex manual callback is unavailable'))
         if (this.challenge === undefined) {
           const error = new Error('OpenAI Codex sign-in finished without an authorization URL')
           this.rejectChallenge(error)
@@ -229,10 +310,13 @@ export class OpenAICodexWebAuth {
         this.state = await this.readStoredStatus()
       },
       async (error: unknown) => {
+        this.manualPromptClosed = true
+        this.pendingManualPrompt?.reject(new Error('OpenAI Codex manual callback is unavailable'))
         this.rejectChallenge(error)
         this.state = await this.statusAfterLoginFailure(error)
       },
     ).finally(() => {
+      this.pendingManualPrompt?.reject(new Error('OpenAI Codex manual callback is unavailable'))
       this.clearChallengeTimer()
       clearTimeout(this.authorizationTimer)
       this.authorizationTimer = undefined
@@ -271,7 +355,9 @@ export class OpenAICodexWebAuth {
       const readUsage = () => readOpenAICodexRateLimits(credentials)
       return {
         status: 'signed-in',
-        usage: await (this.proxyManager?.run(this.resolveProxyUrl(), readUsage) ?? readUsage()),
+        usage: this.quotaState === undefined
+          ? await (this.proxyManager?.run(this.resolveProxyUrl(), readUsage) ?? readUsage())
+          : (await this.quotaState.read(credentials)).usage,
       }
     } catch (error: unknown) {
       if (isOpenAICodexReauthRequiredError(error)) {
@@ -530,8 +616,9 @@ export function registerOpenAICodexAuthRoutes(
   proxyManager?: OpenAICodexProxyManager,
   resolveProxyUrl?: () => string | undefined,
   authorizationTimeoutMs?: number,
+  quotaState?: OpenAICodexQuotaState,
 ): void {
-  const auth = new OpenAICodexWebAuth(store, { proxyManager, resolveProxyUrl, authorizationTimeoutMs })
+  const auth = new OpenAICodexWebAuth(store, { proxyManager, resolveProxyUrl, authorizationTimeoutMs, quotaState })
   const storedFilename = (store as OpenAICodexCredentialStore & { filename?: unknown }).filename
   const fastMode = fastModeOverride ?? new FastModeRegistry()
   const trustedOrigins = trustedOriginsOverride ?? (typeof storedFilename === 'string'
@@ -566,6 +653,34 @@ export function registerOpenAICodexAuthRoutes(
             json(res, 200, await auth.signIn())
           } catch (error: unknown) {
             json(res, 500, { error: safeMessage(error) })
+          }
+        },
+      }),
+      ctx.webServer.register({
+        kind: 'exact',
+        path: OPENAI_CODEX_AUTH_CALLBACK_PATH,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
+          if (!await authorize(req, res)) return
+          const type = header(req, 'content-type')
+          if (type === undefined || !/^application\/json(?:\s*;|$)/iu.test(type.trim())) {
+            return json(res, 415, { error: 'unsupported content type' })
+          }
+          try {
+            const raw = await readFastModeBody(req)
+            if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return json(res, 400, { error: 'invalid input' })
+            const body = raw as Record<string, unknown>
+            if (Object.keys(body).length !== 1 || typeof body['callbackUrl'] !== 'string') {
+              return json(res, 400, { error: 'invalid input' })
+            }
+            const status = auth.submitCallback(body['callbackUrl'])
+            return json(res, status, status === 200 ? { ok: true } : {
+              error: status === 409 ? 'manual callback unavailable' : 'invalid callback URL',
+            })
+          } catch (error: unknown) {
+            return json(res, error instanceof RangeError ? 413 : 400, {
+              error: error instanceof RangeError ? 'request body too large' : 'invalid input',
+            })
           }
         },
       }),
